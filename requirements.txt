@@ -1,0 +1,6 @@
+Appium-Python-Client>=2.3.0
+selenium>=4.0.0
+rich>=12.6.0
+lxml>=4.9.0
+pytest
+pytest-cov
