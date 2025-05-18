@@ -186,3 +186,5 @@ sqlpad.sqlite
 screenshots/
 
 sessions/
+
+xml_capture_base/

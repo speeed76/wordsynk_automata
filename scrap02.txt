@@ -1,0 +1,428 @@
+# filename: parsers/detail_parser.py
+import re
+import sys
+from typing import Optional, List, Dict, Any, Tuple
+import html
+from datetime import datetime, timedelta
+from logger import get_logger
+
+logger = get_logger(__name__)
+
+# --- Patterns and Constants ---
+MJR_ID_PATTERN = re.compile(r"Booking\s+#(MJR\d{8})")
+MJA_REF_PATTERN = re.compile(r"MJA\d{8}")
+DISTANCE_PATTERN = re.compile(r"([\d\.]+)\s+Miles")
+# More flexible phone pattern, allows spaces, optional +44
+PHONE_PATTERN = re.compile(r"^(?:(?:\(?(?:0(?:0|11)\)?[\s-]?\d{2,6})|(?:\+44\s?|00\s?44\s?)(?:\d\s?){0,2}\d{2,6})[\s-]?\d{2,6}(?:[\s-]?\d{2,6})?)$")
+BOOKING_TYPE_SEPARATOR = "|"
+APPOINTMENT_COUNT_PATTERN = re.compile(r"(\d+)\s+Appointments\s*/\s*(\d+)\s+Days")
+DATE_PART_REGEX = re.compile(r"^(\d{2}-\d{2}-\d{4})\s+At$") # For "DD-MM-YYYY At"
+TIME_PART_REGEX = re.compile(r"^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})$") # For "HH:MM - HH:MM"
+POSTCODE_IN_ADDRESS_REGEX = re.compile(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s?\d[A-Z]{2})\b', re.IGNORECASE)
+MEETING_LINK_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b|\bhttps?://\S+')
+
+MULTIDAY_TEXT = "Multiday"
+LANGUAGE_TEXT = "English to Polish" # Assuming this is fixed as per user's project context
+MEETING_LINK_TEXT = "Meeting Link"
+SL_TEXT = "Service Line Item"
+TD_TEXT = "Travel Distance Line Item"
+TT_TEXT = "Travel Time Line Item"
+AEP_TEXT = "Automation Enhancement Payment"
+TOTAL_TEXT = "TOTAL"
+URGENCY_TEXT = "Urgency" # For urgency uplift in payment
+UPLIFT_TEXT = "Uplift"   # For OOH uplift in payment
+DISCLAIMER_START_TEXT = "By accepting this assignment"
+# INFO_BLOCK_TERMINATORS are elements that signify the end of the address/contact block
+INFO_BLOCK_TERMINATORS = ["Timesheets Download", "", SL_TEXT, TOTAL_TEXT, DISCLAIMER_START_TEXT, "Open Directions"]
+
+
+PAYMENT_LABELS_MAP = {
+    "service line item": "pay_sl",
+    "travel distance line item": "pay_td",
+    "travel time line item": "pay_tt",
+    "automation enhancement payment": "pay_aep",
+    # Add other payment labels if they exist
+}
+OOH_SUBSTRING = "uplift" # For "Out of Hours Uplift"
+URGENCY_SUBSTRING = "urgency" # For "Urgency Payment"
+
+def parse_money(raw_value: Optional[str]) -> Optional[float]:
+    if raw_value is None or '£' not in raw_value:
+        if raw_value is not None: logger.debug(f"Value '{raw_value}' not parsed as money: '£' symbol missing.")
+        return None
+    cleaned = re.sub(r"[£,]", "", raw_value).strip()
+    try: return float(cleaned)
+    except (ValueError, TypeError): logger.warning(f"Could not parse money value (after '£' check): '{raw_value}'"); return None
+
+def parse_uk_date(raw_date_str: Optional[str]) -> Optional[str]:
+    if raw_date_str is None: return None
+    date_part = raw_date_str.strip().split(' ')[0]
+    if not re.match(r"^\d{2}-\d{2}-\d{4}$", date_part):
+        if re.match(r"^\d{1,2}-\d{1,2}-\d{4}$", date_part): # Try lenient parsing for D-M-YYYY
+            try: dt = datetime.strptime(date_part, "%d-%m-%Y"); return dt.strftime("%d-%m-%Y")
+            except ValueError: pass
+        logger.warning(f"Date string '{date_part}' is not in DD-MM-YYYY format.")
+        return None
+    try: datetime.strptime(date_part, "%d-%m-%Y"); return date_part
+    except ValueError: logger.warning(f"Date string '{date_part}' is not a valid date."); return None
+
+def parse_time(raw_time: Optional[str]) -> Optional[str]:
+    if raw_time is None: return None
+    parts = raw_time.strip().split(':')
+    if len(parts) == 2:
+        hour_str, minute_str = parts[0].strip(), parts[1].strip()
+        if hour_str.isdigit() and minute_str.isdigit():
+            hour, minute = int(hour_str), int(minute_str)
+            if 0 <= hour < 24 and 0 <= minute < 60: return f"{hour:02d}:{minute:02d}:00"
+    logger.warning(f"Could not parse time value: '{raw_time}'"); return None
+
+def _extract_texts_from_xml(xml_content: str) -> List[str]:
+    texts: List[str] = []
+    text_attribute_regex = re.compile(r'text="([^"]*)"') # Simpler regex
+    try:
+        matches = text_attribute_regex.finditer(xml_content)
+        for match in matches:
+            value = match.group(1)
+            cleaned_text_with_internal_newlines = html.unescape(value).replace("&#10;", "\n")
+            lines = cleaned_text_with_internal_newlines.split('\n')
+            for line in lines:
+                stripped_line = line.strip()
+                if stripped_line: texts.append(stripped_line)
+    except Exception as e: logger.error(f"Could not regex-process XML: {e}")
+    return texts
+
+def extract_header_and_booking_type(texts: List[str]) -> Tuple[Dict[str, Any], bool, Optional[int]]:
+    header_data = {'mjr_id_raw': None, 'total_value_header_raw': None, 'date_time_raw_tuple': None, 'multiday_date_range_raw': None, 'multiday_appointment_count_raw': None}
+    is_multiday = False; lang_idx = -1
+
+    mjr_id_idx = next((i for i, t in enumerate(texts) if t.startswith("Booking #MJR")), -1)
+    multiday_idx = next((i for i, t in enumerate(texts) if t == MULTIDAY_TEXT), -1)
+    lang_idx = next((i for i, t in enumerate(texts) if t == LANGUAGE_TEXT), -1)
+
+    if mjr_id_idx != -1:
+        mjr_match = MJR_ID_PATTERN.search(texts[mjr_id_idx])
+        header_data['mjr_id_raw'] = mjr_match.group(1) if mjr_match else texts[mjr_id_idx]
+    
+    # More robust is_multiday check: if "Multiday" text exists anywhere before where language text is, assume multiday.
+    # If language_text is not found, but multiday_text is, it's also multiday.
+    if multiday_idx != -1: # If "Multiday" text is found
+        if lang_idx != -1: # And language text is found
+            if multiday_idx < lang_idx: # And "Multiday" appears before language
+                is_multiday = True
+        else: # "Multiday" text found, but no language text found (e.g. page cut off)
+            is_multiday = True 
+    logger.debug(f"Determined is_multiday: {is_multiday} (multiday_idx: {multiday_idx}, lang_idx: {lang_idx})")
+
+
+    # Header total is usually before language, or before multiday info if language is far
+    boundary_for_total = len(texts)
+    # Find the earliest of lang_idx or multiday_idx to use as boundary for header_total
+    potential_boundaries = [b for b in [lang_idx, multiday_idx] if b != -1]
+    if potential_boundaries:
+        boundary_for_total = min(potential_boundaries)
+    
+    header_data['total_value_header_raw'] = next((texts[i] for i in range(boundary_for_total) if texts[i].startswith('£')), None)
+
+
+    if is_multiday:
+        # Ensure multiday_idx is valid and elements exist after it
+        if multiday_idx != -1 and multiday_idx + 2 < len(texts):
+            header_data['multiday_date_range_raw'] = texts[multiday_idx + 1]
+            header_data['multiday_appointment_count_raw'] = texts[multiday_idx + 2]
+            logger.debug(f"Extracted Multiday Info: Range='{header_data['multiday_date_range_raw']}', Count='{header_data['multiday_appointment_count_raw']}'")
+        else:
+             logger.warning(f"Multiday text found but not enough subsequent elements for range/count. multiday_idx: {multiday_idx}, len(texts): {len(texts)}")
+    else: # Single day
+        date_part_str = None; time_part_str = None
+        for i, current_line_text in enumerate(texts):
+            if DATE_PART_REGEX.match(current_line_text):
+                if i + 1 < len(texts) and TIME_PART_REGEX.match(texts[i+1]):
+                    date_part_str = current_line_text; time_part_str = texts[i+1]; break
+        if date_part_str and time_part_str: header_data['date_time_raw_tuple'] = (date_part_str, time_part_str)
+        else: logger.debug("Could not find single day Date/Time string structured for header.")
+    logger.debug(f"Header Results: MJR='{header_data['mjr_id_raw']}', HeaderTotal='{header_data['total_value_header_raw']}', IsMultiday={is_multiday}, LangIdx={lang_idx}, DateTimeTuple='{header_data['date_time_raw_tuple']}'")
+    return header_data, is_multiday, lang_idx if lang_idx != -1 else None
+
+
+def extract_info_block(texts: List[str], lang_idx: int) -> Dict[str, Any]:
+    info_data = { k: None for k in ['language_pair_raw', 'client_name_raw', 'address_line1_raw', 'address_line2_raw', 'booking_type_raw', 'contact_name_raw', 'contact_phone_raw', 'distance_raw', 'meeting_link_raw']}
+    if lang_idx == -1 or lang_idx >= len(texts) : logger.error(f"Invalid Language index ({lang_idx}) for info block."); return info_data
+    
+    info_data['language_pair_raw'] = texts[lang_idx]
+    start_processing_idx = lang_idx + 1
+    
+    payment_start_idx = len(texts)
+    # More robust end boundary for info block
+    for i in range(start_processing_idx, len(texts)):
+        text_item = texts[i]
+        is_terminator = False
+        for term in INFO_BLOCK_TERMINATORS:
+            if MJA_REF_PATTERN.match(term): # Check if terminator is an MJA regex
+                if MJA_REF_PATTERN.match(text_item): is_terminator = True; break
+            elif text_item == term: is_terminator = True; break
+        if is_terminator: payment_start_idx = i; break
+            
+    potential_info_texts = texts[start_processing_idx:payment_start_idx]
+    logger.debug(f"Info block. Range: {start_processing_idx}-{payment_start_idx}. Items ({len(potential_info_texts)}): {potential_info_texts}")
+    
+    items_to_parse = list(potential_info_texts) # Use a copy to pop from
+
+    # 1. Client Name
+    if items_to_parse and not info_data['client_name_raw']:
+        candidate = items_to_parse[0]
+        if candidate != MEETING_LINK_TEXT and not DISTANCE_PATTERN.search(candidate) and BOOKING_TYPE_SEPARATOR not in candidate:
+            info_data['client_name_raw'] = items_to_parse.pop(0); logger.debug(f"  Info: Client='{info_data['client_name_raw']}'")
+    # 2. Meeting Link
+    if items_to_parse and items_to_parse[0] == MEETING_LINK_TEXT:
+        items_to_parse.pop(0) # Pop "Meeting Link"
+        if items_to_parse and MEETING_LINK_PATTERN.search(items_to_parse[0]):
+            info_data['meeting_link_raw'] = items_to_parse.pop(0); logger.debug(f"  Info: MeetingLink='{info_data['meeting_link_raw']}'")
+        else: logger.debug(f"  Info: Found 'Meeting Link' label, but next item not a link.")
+    # 3. Address (can be 1 or 2 lines)
+    addr_lines = []
+    while items_to_parse:
+        line = items_to_parse[0]
+        is_addr_line = any(w in line.lower() for w in ["street", "road", "court", "house", "centre", "lane", "building", "floor", "unit", "ltd", "solicitors", "avenue", "drive", "place", "square"]) or POSTCODE_IN_ADDRESS_REGEX.search(line)
+        is_not_other_field = BOOKING_TYPE_SEPARATOR not in line and not PHONE_PATTERN.match(line) and not DISTANCE_PATTERN.search(line) and line != MEETING_LINK_TEXT
+        if is_addr_line and is_not_other_field:
+            addr_lines.append(items_to_parse.pop(0))
+        else: break # Stop if it doesn't look like an address line
+    if addr_lines:
+        info_data['address_line1_raw'] = addr_lines[0]
+        if len(addr_lines) > 1: info_data['address_line2_raw'] = "\n".join(addr_lines[1:]) # Join subsequent lines
+        logger.debug(f"  Info: Address L1='{info_data['address_line1_raw']}', L2='{info_data['address_line2_raw']}'")
+    # 4. Booking Type
+    if items_to_parse and BOOKING_TYPE_SEPARATOR in items_to_parse[0]:
+        info_data['booking_type_raw'] = items_to_parse.pop(0); logger.debug(f"  Info: Booking Type='{info_data['booking_type_raw']}'")
+    # 5. Contact Name
+    if items_to_parse and not PHONE_PATTERN.match(items_to_parse[0]) and not DISTANCE_PATTERN.search(items_to_parse[0]):
+        info_data['contact_name_raw'] = items_to_parse.pop(0); logger.debug(f"  Info: Contact Name='{info_data['contact_name_raw']}'")
+    # 6. Contact Phone
+    if items_to_parse and not DISTANCE_PATTERN.search(items_to_parse[0]):
+        if PHONE_PATTERN.match(items_to_parse[0]) or (len(items_to_parse[0]) > 5 and any(char.isdigit() for char in items_to_parse[0])):
+            info_data['contact_phone_raw'] = items_to_parse.pop(0); logger.debug(f"  Info: Contact Phone='{info_data['contact_phone_raw']}'")
+        else: logger.debug(f"  Skipping '{items_to_parse[0]}' for Contact Phone.")
+    # 7. Distance
+    if items_to_parse and DISTANCE_PATTERN.search(items_to_parse[0]):
+        info_data['distance_raw'] = items_to_parse.pop(0); logger.debug(f"  Info: Distance='{info_data['distance_raw']}'")
+    
+    if items_to_parse: logger.warning(f"  Info: Unassigned items after parsing info block: {items_to_parse}")
+    for key in ['contact_name_raw', 'contact_phone_raw']:
+        value = info_data.get(key)
+        if value is not None and isinstance(value, str) and ("undefined" in value.lower() or value.strip() == '0' or value.strip().lower() == 'null'):
+            info_data[key] = None; logger.debug(f"Sanitized {key}: '{value}' to None")
+    logger.debug(f"Finished parsing info block: {info_data}"); return info_data
+
+def extract_mja_payment_blocks(texts: List[str]) -> List[Dict[str, Any]]:
+    mja_payment_blocks = []
+    # Find all MJA references first
+    mja_indices = [i for i, t in enumerate(texts) if MJA_REF_PATTERN.match(t)]
+    
+    if not mja_indices: # Handle single day booking without explicit MJA prefix before payments
+        sl_idx = next((i for i, t in enumerate(texts) if t == SL_TEXT), -1)
+        if sl_idx != -1:
+            logger.debug("No MJA refs, found Service Line Item. Assuming single payment block.")
+            single_day_payments = {'mja': None} # MJA ID will be from header for single day
+            # Define search boundary: from SL_TEXT to TOTAL_TEXT or end of list
+            search_start_idx = sl_idx
+            search_end_idx = next((i for i, t in enumerate(texts[search_start_idx:], start=search_start_idx) if t == TOTAL_TEXT), len(texts))
+            
+            idx = search_start_idx
+            while idx < search_end_idx:
+                if idx + 1 < search_end_idx: # Ensure label and value pair exists
+                    label_text = texts[idx]
+                    value_text = texts[idx+1]
+                    label_lower = label_text.lower()
+                    logger.debug(f"  Single Day Pay Check: Idx={idx}, Label='{label_text}', Value='{value_text}'")
+                    if value_text.startswith('£'):
+                        pay_key = PAYMENT_LABELS_MAP.get(label_lower)
+                        if pay_key: single_day_payments[pay_key] = value_text
+                        elif URGENCY_SUBSTRING in label_lower: single_day_payments['pay_urg'] = value_text
+                        elif OOH_SUBSTRING in label_lower and 'pay_ooh' not in single_day_payments: single_day_payments['pay_ooh'] = value_text
+                    idx += 2 
+                else: idx += 1 # Should not happen with well-formed pairs
+            if len(single_day_payments) > 1 : mja_payment_blocks.append(single_day_payments)
+        else: logger.debug("No MJA references or Service Line Item found for payment blocks.")
+        return mja_payment_blocks
+
+    # Process blocks for each MJA found
+    logger.debug(f"Found {len(mja_indices)} MJA references for payment blocks.")
+    for i, current_mja_start_idx in enumerate(mja_indices):
+        mja_ref = texts[current_mja_start_idx]
+        payment_details = {'mja': mja_ref}
+        
+        # Define boundary for this MJA's payments
+        # It ends at the next MJA ref, or TOTAL_TEXT, or end of texts list
+        next_mja_idx = mja_indices[i+1] if i + 1 < len(mja_indices) else len(texts)
+        total_after_this_mja = next((k for k, t in enumerate(texts[current_mja_start_idx+1:], start=current_mja_start_idx+1) if t == TOTAL_TEXT), len(texts))
+        block_end_idx = min(next_mja_idx, total_after_this_mja)
+        
+        logger.debug(f"  Extracting payments for {mja_ref} (idx {current_mja_start_idx}) up to index {block_end_idx}")
+        
+        idx = current_mja_start_idx + 1 # Start looking for payments after MJA ref
+        while idx < block_end_idx:
+            if idx + 1 < block_end_idx: # Ensure pair exists
+                label_text = texts[idx]
+                value_text = texts[idx+1]
+                label_lower = label_text.lower()
+                logger.debug(f"    MJA Block ({mja_ref}) Pay Check: Idx={idx}, Label='{label_text}', Value='{value_text}'")
+                if value_text.startswith('£'):
+                    pay_key = PAYMENT_LABELS_MAP.get(label_lower)
+                    if pay_key: payment_details[pay_key] = value_text
+                    elif URGENCY_SUBSTRING in label_lower: payment_details['pay_urg'] = value_text
+                    elif OOH_SUBSTRING in label_lower and 'pay_ooh' not in payment_details: payment_details['pay_ooh'] = value_text
+                idx += 2
+            else: idx += 1
+        if len(payment_details) > 1: mja_payment_blocks.append(payment_details) # Add if any payments found
+    logger.debug(f"Extracted {len(mja_payment_blocks)} MJA payment blocks in total.")
+    return mja_payment_blocks
+
+def extract_notes_and_total(texts: List[str]) -> Dict[str, Any]:
+    notes_total_data = {'notes_raw': None, 'pay_total_raw': None}
+    disclaimer_idx = next((i for i, t in enumerate(texts) if t.startswith(DISCLAIMER_START_TEXT)), len(texts))
+    total_label_idx = -1
+    # Find the *last* occurrence of TOTAL_TEXT before disclaimer
+    for i in range(disclaimer_idx -1, -1, -1):
+        if texts[i] == TOTAL_TEXT:
+            total_label_idx = i
+            break
+            
+    if total_label_idx != -1:
+        notes_start_idx = total_label_idx + 1
+        if total_label_idx + 1 < len(texts) and texts[total_label_idx + 1].startswith('£'):
+            notes_total_data['pay_total_raw'] = texts[total_label_idx + 1]; notes_start_idx = total_label_idx + 2
+            logger.debug(f"Found TOTAL value: {notes_total_data['pay_total_raw']}")
+        else: logger.warning(f"Found TOTAL label but no '£' value follows immediately.")
+        
+        notes_end_idx = disclaimer_idx
+        # Ensure notes are only taken before any MJA refs if they appear after TOTAL (unusual but safeguard)
+        first_mja_after_total_value = next((i for i, t in enumerate(texts[notes_start_idx:], start=notes_start_idx) if MJA_REF_PATTERN.match(t)), notes_end_idx)
+        notes_end_idx = min(notes_end_idx, first_mja_after_total_value)
+
+        if notes_start_idx < notes_end_idx:
+            notes_texts_filtered = [t for t in texts[notes_start_idx:notes_end_idx] if t not in INFO_BLOCK_TERMINATORS and not MJA_REF_PATTERN.match(t)] # Filter out common non-note items
+            notes_total_data['notes_raw'] = "\n".join(notes_texts_filtered).strip() if notes_texts_filtered else None
+            logger.debug(f"Found Notes (length {len(notes_total_data['notes_raw'] or '')}): '{(notes_total_data['notes_raw'] or '')[:100]}...'")
+        else: logger.debug("No text found for notes section.")
+    else: logger.warning("TOTAL anchor not found. Cannot extract notes or pay_total.")
+    return notes_total_data
+
+def parse_detail_data(
+    header_info: Dict[str, Any], is_multiday: bool, info_block: Dict[str, Any],
+    payment_blocks: List[Dict[str, Any]], notes_total_info: Dict[str, Any]
+    ) -> Dict[str, Optional[Any]]:
+    parsed: Dict[str, Any] = {}
+    logger.debug(f"--- Consolidating Detail Data. Header: {header_info}, IsMultiday: {is_multiday} ---")
+    parsed['is_multiday'] = 1 if is_multiday else 0
+    parsed['mjr_id'] = header_info.get('mjr_id_raw')
+    parsed['header_total'] = parse_money(header_info.get('total_value_header_raw'))
+    parsed['booking_date'], parsed['start_time'], parsed['end_time'], parsed['duration'] = None, None, None, None
+
+    if is_multiday:
+        parsed['multiday_date_range'] = header_info.get('multiday_date_range_raw')
+        parsed['multiday_appointment_info'] = header_info.get('multiday_appointment_count_raw')
+    else:
+        parsed['multiday_date_range'], parsed['multiday_appointment_info'] = None, None
+        date_time_tuple = header_info.get('date_time_raw_tuple')
+        if date_time_tuple and isinstance(date_time_tuple, tuple) and len(date_time_tuple) == 2:
+            date_part_str, time_part_str = date_time_tuple
+            date_match = DATE_PART_REGEX.match(date_part_str)
+            if date_match: parsed['booking_date'] = parse_uk_date(date_match.group(1))
+            time_match = TIME_PART_REGEX.match(time_part_str)
+            if time_match:
+                parsed['start_time'] = parse_time(time_match.group(1))
+                parsed['end_time'] = parse_time(time_match.group(2))
+                st_obj = _parse_time_str_to_datetime(time_match.group(1))
+                et_obj = _parse_time_str_to_datetime(time_match.group(2))
+                parsed['duration'] = _calculate_duration_str(st_obj, et_obj)
+        else: logger.warning(f"Could not parse date/time for single day from header: {header_info.get('date_time_raw_tuple')}")
+
+    for key, raw_key in {'language_pair': 'language_pair_raw', 'client_name': 'client_name_raw', 'booking_type': 'booking_type_raw', 'contact_name': 'contact_name_raw', 'contact_phone': 'contact_phone_raw', 'meeting_link': 'meeting_link_raw'}.items():
+        parsed[key] = info_block.get(raw_key)
+    addr1 = info_block.get('address_line1_raw'); addr2 = info_block.get('address_line2_raw')
+    parsed['address'] = "\n".join(filter(None, [addr1, addr2])).strip() if (addr1 or addr2) else None
+    dist_raw = info_block.get('distance_raw')
+    parsed['travel_distance'] = None
+    if dist_raw:
+        dist_match = DISTANCE_PATTERN.search(dist_raw)
+        if dist_match:
+            try: parsed['travel_distance'] = float(dist_match.group(1))
+            except (ValueError, TypeError): logger.warning(f"Could not parse distance value: {dist_raw}")
+    
+    parsed['overall_total'] = parse_money(notes_total_info.get('pay_total_raw'))
+    parsed['multiday_payments'] = []
+    calculated_day_total: Optional[float] = None
+
+    if is_multiday:
+        parsed['mja_id'] = None 
+        start_date_obj: Optional[datetime.date] = None
+        if parsed.get('multiday_date_range_raw'):
+            try:
+                start_date_str_from_range = parsed['multiday_date_range_raw'].split(' - ')[0].strip()
+                temp_date_uk = parse_uk_date(start_date_str_from_range)
+                if temp_date_uk: start_date_obj = datetime.strptime(temp_date_uk, "%d-%m-%Y").date()
+            except Exception as e: logger.error(f"Could not parse start date from range '{parsed.get('multiday_date_range_raw')}': {e}")
+
+        logger.debug(f"Multiday processing. Payment blocks found: {len(payment_blocks)}")
+        for i, day_payment_raw in enumerate(payment_blocks):
+            if not isinstance(day_payment_raw, dict): continue
+            parsed_day: Dict[str, Any] = {'mja': day_payment_raw.get('mja')}
+            day_booking_date: Optional[str] = None
+            if start_date_obj:
+                try: day_booking_date = (start_date_obj + timedelta(days=i)).strftime("%d-%m-%Y")
+                except Exception as e_calc: logger.error(f"Error calculating date for MJA seq {i+1}: {e_calc}")
+            parsed_day['booking_date'] = day_booking_date
+            # For multiday bookings, detail page header usually doesn't have start/end times.
+            # If such times were common to all days and appeared in header, logic could be added.
+            # For now, these are specific to each MJA day if extract_mja_payment_blocks can find them.
+            parsed_day['start_time'] = None 
+            parsed_day['end_time'] = None   
+            parsed_day['duration'] = None   
+            for key_suffix in ['sl', 'td', 'tt', 'aep', 'ooh', 'urg']:
+                parsed_day[f'pay_{key_suffix}'] = parse_money(day_payment_raw.get(f'pay_{key_suffix}'))
+            parsed['multiday_payments'].append(parsed_day)
+            logger.debug(f"Processed MJA {parsed_day.get('mja')} for date {day_booking_date} with payments: {day_payment_raw}")
+
+        num_days = 0
+        if parsed['multiday_appointment_info']:
+             match = APPOINTMENT_COUNT_PATTERN.search(parsed['multiday_appointment_info'])
+             if match:
+                  try: num_days_str = match.group(2) or match.group(1); num_days = int(num_days_str) if num_days_str else 0
+                  except: num_days = 0
+        if num_days == 0 and parsed['multiday_payments']: num_days = len(parsed['multiday_payments'])
+        if num_days > 0 and parsed['overall_total'] is not None:
+             try: calculated_day_total = round(parsed['overall_total'] / num_days, 2)
+             except ZeroDivisionError: calculated_day_total = None
+        else: calculated_day_total = None
+        for key_suffix in ['sl', 'td', 'tt', 'aep', 'ooh', 'urg']: parsed[f'day_pay_{key_suffix}'] = None # Nullify MJR-level day_pay fields
+        parsed['day_total'] = calculated_day_total # MJR-level average day_total
+    else: # Single Day
+        single_day_payment_data = payment_blocks[0] if payment_blocks and isinstance(payment_blocks[0], dict) else {}
+        parsed['mja_id'] = single_day_payment_data.get('mja')
+        parsed['multiday_payments'] = None 
+        for key_suffix in ['sl', 'td', 'tt', 'aep', 'ooh', 'urg']:
+             parsed[f"day_pay_{key_suffix}"] = parse_money(single_day_payment_data.get(f"pay_{key_suffix}"))
+        parsed['day_total'] = parsed['overall_total']
+        # For single day, booking_date, start_time, end_time, duration are already set from header parsing logic
+
+    parsed['notes'] = notes_total_info.get('notes_raw')
+    if (not parsed.get('meeting_link') or parsed.get('meeting_link') == MEETING_LINK_TEXT) and parsed.get('notes'):
+         link_match = MEETING_LINK_PATTERN.search(parsed['notes'])
+         if link_match: parsed['meeting_link'] = link_match.group(0); logger.info(f"Extracted meeting link from notes: {parsed['meeting_link']}")
+    if parsed.get('meeting_link') == MEETING_LINK_TEXT: parsed['meeting_link'] = None
+    
+    logger.debug(f"Final Parsed Detail Data (keys: {list(parsed.keys())})")
+    return parsed
+
+def check_if_multiday_from_xml(xml_content: str) -> bool:
+    # ... (same as before)
+    logger.debug("Performing quick check for 'Multiday' text...")
+    text_attribute_regex = re.compile(r'\btext="([^"]*)"')
+    try:
+        matches = text_attribute_regex.finditer(xml_content)
+        for match in matches:
+            if MULTIDAY_TEXT in html.unescape(match.group(1)): return True
+    except Exception as e: logger.error(f"Error in quick multiday check: {e}")
+
+
+    logger.debug("Did not find 'Multiday' text during quick check."); return False

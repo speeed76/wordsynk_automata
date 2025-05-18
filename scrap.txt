@@ -1,0 +1,551 @@
+# filename: pages/list_page.py
+import time
+from appium.webdriver.common.appiumby import AppiumBy
+from selenium.common import (
+    NoSuchElementException,
+    TimeoutException,
+    StaleElementReferenceException
+)
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from lxml import etree
+from parsers.mja_parser import parse_mja # This will now handle status prefixes
+from logger import get_logger
+from typing import List, Dict, Any, Optional
+
+logger = get_logger(__name__)
+
+class ListPage:
+    """
+    Page Object for the main booking list screen.
+    Uses efficient XML parsing of page_source for data extraction.
+    Handles scrolling of the list.
+    """
+    CARD_CONTAINER_SELECTOR = 'androidx.recyclerview.widget.RecyclerView'
+    # XPath to find ViewGroup elements that are likely booking cards based on having a content-desc
+    # We will rely on parse_mja to validate if it's a true booking card
+    BOOKING_CARD_XPATH = '//android.view.ViewGroup[@content-desc]'
+
+
+    def __init__(self, driver):
+        self.driver = driver
+
+    def is_displayed(self, timeout=5) -> bool:
+        """Checks if the main list container is visible."""
+        try:
+            WebDriverWait(self.driver, timeout).until(
+                EC.presence_of_element_located((AppiumBy.CLASS_NAME, self.CARD_CONTAINER_SELECTOR))
+            )
+            logger.debug("List page container is displayed.")
+            return True
+        except TimeoutException:
+            logger.debug("List page container not displayed within timeout.")
+            return False
+        except Exception as e:
+            logger.error(f"Error checking if list page is displayed: {e}")
+            return False
+
+    def get_cards(self) -> List[Dict[str, Any]]:
+        """
+        Finds all potential booking cards by parsing the page source XML
+        and passes their content-desc to the mja_parser.
+        The mja_parser will determine if it's a valid card and extract data including status.
+
+        Returns:
+            List[Dict[str, Any]]: A list of dictionaries, where each dictionary
+                                  contains the parsed data for a booking card.
+        """
+        cards_data = []
+        logger.info("Getting list page cards using XML parsing...")
+        try:
+            if not self.is_displayed(timeout=3):
+                logger.error("List page container not found before getting page source for cards.")
+                return cards_data
+
+            page_source = self.driver.page_source
+            if not page_source:
+                logger.error("Failed to get page source for list page.")
+                return cards_data
+
+            xml_root = etree.fromstring(page_source.encode('utf-8'))
+            card_nodes = xml_root.xpath(self.BOOKING_CARD_XPATH)
+            logger.debug(f"Found {len(card_nodes)} potential card nodes via XPath on XML source (ViewGroup with content-desc).")
+
+            for node in card_nodes:
+                content_desc = node.get('content-desc', '')
+                if content_desc: # Process any non-empty content-desc
+                    logger.debug(f"Processing content-desc: '{content_desc}'")
+                    try:
+                        # parse_mja will handle status prefixes and MJA ID extraction
+                        parsed_info = parse_mja(content_desc)
+                        if parsed_info and parsed_info.get('booking_id'):
+                            cards_data.append(parsed_info)
+                            logger.debug(f"Successfully parsed card: {parsed_info.get('booking_id')}, Status: {parsed_info.get('card_status').value}")
+                        elif parsed_info and parsed_info.get('card_status') == BookingCardStatus.CANCELLED and parsed_info.get('booking_id') is None:
+                            # Handle case where parser identified 'Cancelled' but no MJA ID
+                            logger.warning(f"Found a 'Cancelled' card with no MJA ID in content-desc: '{content_desc}'. Storing minimal info.")
+                            cards_data.append(parsed_info) # Store to record cancellation
+                        # else: # parse_mja returning None means it wasn't a valid MJA card entry
+                            # logger.debug(f"Content-desc '{content_desc}' did not parse to a valid MJA card.")
+
+                    except Exception as parse_e:
+                        logger.error(f"Error parsing content-desc '{content_desc}': {parse_e}")
+        except etree.XMLSyntaxError as xml_e:
+            logger.error(f"Failed to parse page source XML: {xml_e}")
+        except TimeoutException:
+            logger.warning("List page container not found for get_cards.")
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred in get_cards: {e}")
+
+        logger.info(f"Successfully extracted data for {len(cards_data)} cards from list page XML source.")
+        return cards_data
+
+    def scroll(self, last_element_booking_id: Optional[str] = None, direction: str = 'down'):
+        """
+        Performs a scroll gesture, prioritizing anchoring to the last known element
+        or the scroll container, with refined coordinates and percentage.
+        """
+        try:
+            logger.debug(f"Scrolling {direction}...")
+            scroll_anchor_element = None
+            element_to_scroll_id = None
+
+            if last_element_booking_id:
+                 try:
+                      # This selector needs to find the element regardless of prefix, using contains MJA ID
+                      last_elem_selector = f'//android.view.ViewGroup[@content-desc and contains(@content-desc, "{last_element_booking_id}")]'
+                      scroll_anchor_element = WebDriverWait(self.driver, 2).until(
+                          EC.presence_of_element_located((AppiumBy.XPATH, last_elem_selector))
+                      )
+                      element_to_scroll_id = scroll_anchor_element.id
+                      logger.debug(f"Found element containing {last_element_booking_id} to use as scroll anchor.")
+                 except (NoSuchElementException, TimeoutException):
+                      logger.warning(f"Could not re-find element containing {last_element_booking_id} for scroll. Attempting container scroll.")
+                      element_to_scroll_id = None
+
+            if not element_to_scroll_id: # Fallback to container
+                try:
+                    container_element = WebDriverWait(self.driver, 2).until(
+                        EC.presence_of_element_located((AppiumBy.CLASS_NAME, self.CARD_CONTAINER_SELECTOR))
+                    )
+                    element_to_scroll_id = container_element.id
+                    logger.debug(f"Using {self.CARD_CONTAINER_SELECTOR} container as scroll anchor.")
+                except (NoSuchElementException, TimeoutException):
+                    logger.warning(f"Could not find {self.CARD_CONTAINER_SELECTOR} container. Falling back to coordinate-based scroll.")
+                    element_to_scroll_id = None
+
+            scroll_percent = 0.6
+
+            if element_to_scroll_id:
+                try:
+                    self.driver.execute_script('mobile: scrollGesture', {
+                        'elementId': element_to_scroll_id,
+                        'direction': direction,
+                        'percent': scroll_percent
+                    })
+                    logger.debug(f"Scrolled using elementId: {element_to_scroll_id} with percent: {scroll_percent}")
+                    time.sleep(1); return
+                except Exception as el_scroll_e:
+                    logger.warning(f"Could not scroll using elementId ('{el_scroll_e}'). Falling back to coordinate-based scroll.")
+
+            logger.debug("Performing coordinate-based screen scroll with refined bounds.")
+            size = self.driver.get_window_size()
+            start_x = size['width'] // 2
+            start_y = int(size['height'] * 0.7); end_y = int(size['height'] * 0.3)
+            scroll_gesture_height = start_y - end_y
+
+            if scroll_gesture_height <= 0:
+                 logger.error(f"Calculated scroll gesture height ({scroll_gesture_height}) is not positive. Cannot scroll by coordinates.")
+                 return
+
+            self.driver.execute_script('mobile: scrollGesture', {
+                'left': start_x, 'top': start_y, 'width': 1,
+                'height': scroll_gesture_height,
+                'direction': direction,
+                'percent': 1.0
+            })
+            logger.debug(f"Scrolled using coordinates from y={start_y} to y={end_y} (gesture height: {scroll_gesture_height}).")
+            time.sleep(1)
+
+        except Exception as e:
+            logger.exception(f"An error occurred during the scroll operation: {e}")
+
+# filename: processors/list_processor.py
+import os
+from logger import get_logger
+from db.repository import insert_booking_base, get_processed_booking_ids, update_booking_status
+from pages.list_page import ListPage
+from state.models import ScrapeState, BookingCardStatus, BookingProcessingStatus
+from state.manager import StateManager
+from appium.webdriver.common.appiumby import AppiumBy
+from selenium.common import TimeoutException, StaleElementReferenceException, NoSuchElementException
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
+from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
+
+from config import DUMP_XML_MODE
+from utils.xml_dumper import save_xml_dump
+
+
+if TYPE_CHECKING:
+    from services.crawler_service import CrawlerService
+
+logger = get_logger(__name__)
+
+class ListProcessor:
+    def __init__(self, driver, conn, list_page: ListPage, state_manager: StateManager, target_display_id: str = "0", crawler_service: 'CrawlerService' = None):
+        self.driver = driver
+        self.conn = conn
+        self.list_page = list_page
+        self.state_manager = state_manager
+        self.target_display_id_str = target_display_id
+        self.crawler_service = crawler_service
+        self.processed_ids_this_cycle = set()
+        self.session_clicked_mja_ids = set()
+        self.scroll_attempts = 0
+        self.max_scroll_attempts = 3 # Default, can be configured
+        self.last_good_scroll_anchor_id: Optional[str] = None
+        self.screenshot_dir = "screenshots"
+        if not os.path.exists(self.screenshot_dir):
+             try: os.makedirs(self.screenshot_dir)
+             except OSError as e: logger.error(f"Could not create screenshot dir '{self.screenshot_dir}': {e}")
+
+    def _ensure_on_list_page(self, initial_check=False) -> bool:
+        if not initial_check: return self.list_page.is_displayed(timeout=1)
+        retries = 3
+        while retries > 0:
+            if self.list_page.is_displayed(timeout=1): return True
+            logger.warning("Not on list page. Attempting back.")
+            try: self.driver.back(); time.sleep(1.5)
+            except Exception as e: logger.error(f"Error navigating back: {e}")
+            retries -= 1
+        logger.error("Failed to ensure list page."); return False
+
+    def _apply_display_setting(self):
+        if self.target_display_id_str == "0" or not self.target_display_id_str: return
+        try: self.driver.update_settings({"displayId": int(self.target_display_id_str)})
+        except ValueError: logger.warning(f"Target display ID '{self.target_display_id_str}' not an int.")
+        except Exception as e: logger.error(f"Failed to apply displayId setting: {e}")
+
+    def _is_element_fully_visible(self, element: WebElement, window_height: int) -> bool:
+        try:
+            loc = element.location; sz = element.size; top_m = 0.15; bot_m = 0.85
+            top_b = window_height * top_m; bot_b = window_height * bot_m
+            el_top = loc['y']; el_bot = el_top + sz['height']
+            is_vis = el_top >= top_b and el_bot <= bot_b and element.is_displayed()
+            logger.debug(f"Visibility check for element at y={el_top}, h={sz['height']}: FullyVis={is_vis} (Bounds:{top_b:.0f}-{bot_b:.0f})")
+            return is_vis
+        except: return False
+
+    def _select_card_to_click(
+        self, unprocessed_cards: List[Dict[str, Any]], window_height: int
+    ) -> Optional[Tuple[Dict[str, Any], WebElement]]:
+        if not unprocessed_cards: return None
+        candidates = []
+        screen_center_y = window_height / 2
+        for card_data in unprocessed_cards:
+            booking_id = card_data.get('booking_id')
+            if not booking_id: continue
+            try:
+                click_selector = f'//android.view.ViewGroup[@content-desc and contains(@content-desc, "{booking_id}")]'
+                element = WebDriverWait(self.driver, 2).until(EC.element_to_be_clickable((AppiumBy.XPATH, click_selector)))
+                if self._is_element_fully_visible(element, window_height):
+                    loc = element.location; sz = element.size; el_center_y = loc['y'] + (sz['height'] / 2)
+                    candidates.append({'data': card_data, 'element': element, 'distance': abs(el_center_y - screen_center_y)})
+                else: logger.debug(f"Card {booking_id} (Normal) found but not fully visible for click.")
+            except: pass
+        if not candidates: logger.info("No suitable (fully visible, clickable) 'Normal' unprocessed cards found."); return None
+        candidates.sort(key=lambda x: x['distance']); selected = candidates[0]
+        logger.info(f"Selected card {selected['data']['booking_id']} (Status: Normal) to click.")
+        return selected['data'], selected['element']
+
+    def process(self, is_initial_entry=True) -> ScrapeState:
+        logger.info(f"Processing State: LIST (Display {self.target_display_id_str}, Initial Entry: {is_initial_entry})")
+        session_id_str = f"session_{self.state_manager.session_id if self.state_manager else 'unknown'}"
+
+        if is_initial_entry:
+            self.processed_ids_this_cycle.clear()
+            # self.scroll_attempts = 0 # Reset scroll attempts on truly fresh list view
+            # session_clicked_mja_ids is for the entire session in dump mode, not reset here
+            if DUMP_XML_MODE and self.driver:
+                 try: save_xml_dump(self.driver.page_source, "MJA_list", session_id_str, sequence_or_stage="initial_view_00")
+                 except Exception as e: logger.error(f"Could not dump initial list XML: {e}")
+        
+        # If it's not an initial entry, it implies a scroll just happened or returning from error.
+        # The scroll_attempts should have been managed by the previous call.
+        # If it's the very first time (is_initial_entry=True), reset scroll_attempts.
+        if is_initial_entry:
+            self.scroll_attempts = 0
+
+
+        if is_initial_entry and not self._ensure_on_list_page(initial_check=True):
+            self.state_manager.update_state(ScrapeState.ERROR, error_message="Failed to ensure on list page"); return ScrapeState.ERROR
+        
+        all_processed_ids_db = get_processed_booking_ids(self.conn) if not DUMP_XML_MODE else set()
+
+        try:
+            self._apply_display_setting()
+            cards_on_screen = self.list_page.get_cards()
+            logger.info(f"Found data for {len(cards_on_screen)} cards on screen via XML.")
+
+            if not cards_on_screen:
+                 if self.scroll_attempts == 0 and is_initial_entry: # First ever view, no cards
+                     self.state_manager.update_state(ScrapeState.ERROR, error_message="No cards on list page"); return ScrapeState.ERROR
+                 else: # No cards after a scroll, or not initial entry (e.g. list was empty after processing all)
+                     logger.warning("ListPage.get_cards returned no card data. Proceeding to scroll/finish logic.")
+                     # Fall through to scroll/finish logic
+            
+            unprocessed_for_click_candidates = []
+            window_height = self.driver.get_window_size()['height']
+            temp_last_good_anchor = None
+            any_new_unprocessed_card_found_on_screen = False # New flag
+
+            if cards_on_screen: # Only process if cards were actually found
+                for card_data in cards_on_screen:
+                    booking_id = card_data.get('booking_id')
+                    card_status_enum = card_data.get('card_status', BookingCardStatus.NORMAL)
+                    if not booking_id: continue
+                    logger.debug(f"Card {booking_id}: Parsed card_status_enum: {card_status_enum.value if card_status_enum else 'N/A'}")
+
+                    skip_this_card = False
+                    is_in_cycle = booking_id in self.processed_ids_this_cycle
+                    
+                    if DUMP_XML_MODE:
+                        if booking_id in self.session_clicked_mja_ids: skip_this_card = True; logger.debug(f"Card {booking_id} already in DUMP_XML_MODE session_clicked_mja_ids. Skipping.")
+                    else:
+                        db_status_val = None; is_in_db_final = False
+                        cursor = self.conn.cursor(); cursor.execute("SELECT status FROM bookings WHERE booking_id = ?", (booking_id,)); db_row = cursor.fetchone()
+                        db_status_val = db_row[0] if db_row else None
+                        is_in_db_final = db_status_val in [BookingProcessingStatus.SCRAPED.value, BookingProcessingStatus.CANCELLED_ON_LIST.value, BookingProcessingStatus.SKIPPED_OFFER_VIEWED.value]
+                        if is_in_db_final: skip_this_card = True; logger.debug(f"Card {booking_id} already in final DB state ('{db_status_val}'). Skipping.")
+                    
+                    if is_in_cycle:
+                        if not skip_this_card: logger.debug(f"Card {booking_id} already in processed_ids_this_cycle. Skipping.")
+                        skip_this_card = True 
+
+                    if skip_this_card:
+                        if not is_in_cycle: self.processed_ids_this_cycle.add(booking_id)
+                        try:
+                             desc_prefix = f"{card_status_enum.value}, " if card_status_enum not in [BookingCardStatus.NORMAL, BookingCardStatus.UNKNOWN] else ""
+                             element = self.driver.find_element(AppiumBy.XPATH, f'//android.view.ViewGroup[@content-desc and starts-with(@content-desc, "{desc_prefix}{booking_id}")]')
+                             if self._is_element_fully_visible(element, window_height): temp_last_good_anchor = booking_id
+                        except: pass
+                        continue
+
+                    any_new_unprocessed_card_found_on_screen = True # Found a card not skipped for being processed
+
+                    if card_status_enum == BookingCardStatus.CANCELLED:
+                        logger.info(f"Booking {booking_id} is CANCELLED. Saving base info only.")
+                        insert_booking_base(self.conn, card_data)
+                        self.processed_ids_this_cycle.add(booking_id); temp_last_good_anchor = booking_id
+                        if DUMP_XML_MODE: self.session_clicked_mja_ids.add(booking_id)
+                        continue 
+                    if card_status_enum in [BookingCardStatus.NEW_OFFER, BookingCardStatus.VIEWED]:
+                        logger.info(f"Booking {booking_id} is '{card_status_enum.value}'. Skipping full scrape.")
+                        update_booking_status(self.conn, booking_id, BookingProcessingStatus.SKIPPED_OFFER_VIEWED.value, f"Card status: {card_status_enum.value}")
+                        self.processed_ids_this_cycle.add(booking_id); temp_last_good_anchor = booking_id
+                        if DUMP_XML_MODE: self.session_clicked_mja_ids.add(booking_id)
+                        continue 
+                    if card_status_enum == BookingCardStatus.NORMAL:
+                        logger.debug(f"Card {booking_id} is Normal and unprocessed. Adding to click candidates.")
+                        unprocessed_for_click_candidates.append(card_data)
+                    else:
+                        logger.warning(f"Card {booking_id} has unhandled status '{card_status_enum.value}'. Marking for this cycle.")
+                        self.processed_ids_this_cycle.add(booking_id)
+
+                if temp_last_good_anchor: self.last_good_scroll_anchor_id = temp_last_good_anchor
+                elif cards_on_screen: self.last_good_scroll_anchor_id = cards_on_screen[-1].get('booking_id')
+            
+            # If we found any new, unprocessed card on screen (regardless of type or clickability for now)
+            # it means the previous scroll (if any) was productive in bringing new items.
+            if any_new_unprocessed_card_found_on_screen:
+                logger.debug("New unprocessed cards were visible on this screen view. Resetting scroll_attempts.")
+                self.scroll_attempts = 0 
+            
+            logger.info(f"Found {len(unprocessed_for_click_candidates)} 'Normal' unprocessed cards for potential click.")
+            selection = None
+            if unprocessed_for_click_candidates:
+                selection = self._select_card_to_click(unprocessed_for_click_candidates, window_height)
+
+            if selection:
+                selected_card_data, clickable_element = selection
+                # self.scroll_attempts = 0 # Already reset if any_new_unprocessed_card_found_on_screen
+                booking_id_to_click = selected_card_data['booking_id']
+                insert_booking_base(self.conn, selected_card_data)
+                self.processed_ids_this_cycle.add(booking_id_to_click)
+                if DUMP_XML_MODE: self.session_clicked_mja_ids.add(booking_id_to_click)
+                self.last_good_scroll_anchor_id = booking_id_to_click
+                self.state_manager.update_state(ScrapeState.SECONDARY, current_booking_id=booking_id_to_click, last_processed_booking_id=booking_id_to_click)
+                try:
+                    logger.info(f"Attempting click on selected card {booking_id_to_click}"); clickable_element.click(); logger.info(f"Clicked card {booking_id_to_click}"); time.sleep(1.5)
+                    return ScrapeState.SECONDARY
+                except StaleElementReferenceException: logger.warning(f"Element for {booking_id_to_click} stale."); self.state_manager.update_state(ScrapeState.LIST, current_booking_id=None); return ScrapeState.LIST
+                except Exception as click_e: logger.exception(f"Click error: {click_e}"); self.state_manager.update_state(ScrapeState.ERROR); return ScrapeState.ERROR
+            else: # No 'Normal' card was selected for click (either none found, or none visible enough)
+                logger.info("No suitable 'Normal' unprocessed card was selected to click on this screen.")
+                # If no card was clicked, but new unprocessed items *were* seen, we already reset scroll_attempts.
+                # If no card was clicked AND no new unprocessed items were seen at all (any_new_unprocessed_card_found_on_screen is False),
+                # then we proceed to increment scroll_attempts if we scroll.
+
+            # Scroll Action: Only if no card was selected for clicking
+            if self.scroll_attempts >= self.max_scroll_attempts:
+                logger.info(f"Max scroll attempts ({self.max_scroll_attempts}) reached without successful click. Finishing.")
+                self.state_manager.finish_session(status='completed_max_scrolls'); return ScrapeState.FINISHED
+            else:
+                # Increment scroll_attempts ONLY if the screen had no new processable items *at all*
+                # OR if it had new items, but none were clickable and we are forced to scroll.
+                # The reset of scroll_attempts now happens if *any* new unprocessed card is found.
+                # So, we should increment here if we are about to scroll because no click happened.
+                if not selection: # If we didn't click anything
+                    self.scroll_attempts += 1 
+                
+                logger.info(f"Attempting scroll (current attempt: {self.scroll_attempts}/{self.max_scroll_attempts})")
+                try:
+                    logger.debug(f"Using anchor '{self.last_good_scroll_anchor_id}' for scroll.")
+                    self.list_page.scroll(self.last_good_scroll_anchor_id)
+                    if DUMP_XML_MODE and self.driver: save_xml_dump(self.driver.page_source, "MJA_list", session_id_str, sequence_or_stage=f"scroll_{self.scroll_attempts:02d}")
+                    if self.crawler_service: self.crawler_service.take_screenshot_on_display(str(self.target_display_id_str), os.path.join(self.screenshot_dir, f"after_scroll_{self.scroll_attempts}.png"))
+                    logger.debug("Waiting after scroll..."); time.sleep(2.0)
+                    self.state_manager.update_state(ScrapeState.LIST, current_booking_id=None)
+                    return ScrapeState.LIST
+                except Exception as scroll_e: logger.exception(f"Scroll error: {scroll_e}"); self.state_manager.update_state(ScrapeState.ERROR); return ScrapeState.ERROR
+        except Exception as e: logger.exception(f"ListProcessor error: {e}"); self.state_manager.update_state(ScrapeState.ERROR); return ScrapeState.ERROR
+
+# filename: parsers/mja_parser.py
+import re
+from typing import Dict, Optional, Tuple, Any
+from datetime import datetime, timedelta
+from utils.sanitize import sanitize_postcode
+from logger import get_logger
+from state.models import BookingCardStatus # Import the Enum
+
+logger = get_logger(__name__)
+
+MJA_ID_REGEX = re.compile(r"(MJA\d{8})") # Regex to find MJA ID
+DURATION_REGEX = re.compile(r"(\d{1,2}:\d{2})\s*(?:to|-)\s*(\d{1,2}:\d{2})")
+
+KNOWN_STATUS_PREFIXES = {
+    "Cancelled,": BookingCardStatus.CANCELLED,
+    "New Offer,": BookingCardStatus.NEW_OFFER,
+    "Viewed,": BookingCardStatus.VIEWED,
+    # Add other exact prefixes if they exist, including the trailing comma if always present
+}
+
+def _parse_time_str_to_datetime(time_str: str) -> Optional[datetime.time]:
+    if not time_str: return None
+    try:
+        parts = time_str.split(':')
+        if len(parts) == 2:
+             hour = int(parts[0]); minute = int(parts[1])
+             if 0 <= hour < 24 and 0 <= minute < 60:
+                  return datetime.strptime(f"{hour:02d}:{minute:02d}", "%H:%M").time()
+    except ValueError: logger.warning(f"Could not parse time string '{time_str}' to time object.")
+    return None
+
+def _calculate_duration_str(start_time_obj: Optional[datetime.time], end_time_obj: Optional[datetime.time]) -> Optional[str]:
+    if not start_time_obj or not end_time_obj: return None
+    dummy_date = datetime(2000, 1, 1)
+    start_dt = datetime.combine(dummy_date, start_time_obj)
+    end_dt = datetime.combine(dummy_date, end_time_obj)
+    if end_dt < start_dt: end_dt += timedelta(days=1)
+    elif end_dt == start_dt: return "00:00"
+    duration_delta = end_dt - start_dt
+    total_seconds = duration_delta.total_seconds()
+    if total_seconds < 0: return None
+    hours = int(total_seconds // 3600); minutes = int((total_seconds % 3600) // 60)
+    return f"{hours:02d}:{minutes:02d}"
+
+def parse_mja(desc_str: str) -> Optional[Dict[str, Any]]:
+    if not desc_str:
+        logger.debug("MJA Parse: Received empty description string.")
+        return None
+
+    original_desc_for_log = desc_str
+    logger.debug(f"MJA Parse: Starting parsing for desc_str: '{original_desc_for_log}'")
+
+    card_status = BookingCardStatus.NORMAL
+    # Use a temporary variable for stripping prefixes, so original_desc_for_log remains unchanged for logging
+    desc_to_process = desc_str 
+
+    for prefix_key, status_enum in KNOWN_STATUS_PREFIXES.items():
+        if desc_to_process.startswith(prefix_key):
+            card_status = status_enum
+            # Strip the prefix and any immediately following space or comma + space
+            desc_to_process = desc_to_process[len(prefix_key):].lstrip(" ,") 
+            logger.info(f"MJA Parse: Found card status '{status_enum.value}' (Prefix: '{prefix_key}'). Remaining desc for MJA ID: '{desc_to_process}'")
+            break # A card should only have one such status prefix
+    
+    # Now, search for MJA ID in the (potentially modified) desc_to_process
+    mja_match = MJA_ID_REGEX.search(desc_to_process)
+    if not mja_match:
+        logger.warning(f"MJA Parse: No MJA ID found in segment: '{desc_to_process}' (Original full desc: '{original_desc_for_log}')")
+        # If a known status was identified but no MJA, decide how to handle.
+        # For 'Cancelled', you might want to record it even without MJA if that's possible.
+        # For now, if MJA is critical, we return None.
+        return None
+
+    booking_id = mja_match.group(1)
+    logger.debug(f"MJA Parse ({booking_id}): Extracted MJA ID. Original full desc: '{original_desc_for_log}'")
+
+    # The remaining parts for postcode, duration, language are *after* the MJA ID
+    idx_after_mja_id = mja_match.end()
+    remaining_after_mja = desc_to_process[idx_after_mja_id:].lstrip(", ")
+    
+    parts = [p.strip() for p in remaining_after_mja.split(',') if p.strip()]
+    logger.debug(f"MJA Parse ({booking_id}): Parts after MJA ID: {parts}")
+
+
+    postcode_raw = None; start_time_raw = None; end_time_raw = None
+    language_pair = None; calculated_duration_str = None; is_remote = 0
+    original_duration_str = None
+    processed_indices = set() # To track which parts of `parts` list are consumed
+
+    # 1. Identify Duration from `parts`
+    for i, part in enumerate(parts):
+        duration_match = DURATION_REGEX.search(part)
+        if duration_match:
+            start_time_raw = duration_match.group(1); end_time_raw = duration_match.group(2)
+            start_obj = _parse_time_str_to_datetime(start_time_raw); end_obj = _parse_time_str_to_datetime(end_time_raw)
+            calculated_duration_str = _calculate_duration_str(start_obj, end_obj)
+            original_duration_str = f"{start_time_raw} to {end_time_raw}" # Store a consistent format
+            processed_indices.add(i); logger.debug(f"MJA Parse ({booking_id}): Found Duration in part '{part}'")
+            break
+            
+    # 2. Identify Postcode or "Remote" from `parts`
+    # Iterate through parts not yet processed
+    for i, part in enumerate(parts):
+        if i in processed_indices: continue
+        if part.lower() == "remote":
+            is_remote = 1; postcode_raw = None; processed_indices.add(i)
+            logger.debug(f"MJA Parse ({booking_id}): Found 'Remote' keyword.")
+            break 
+        if postcode_raw is None: # Only search for postcode if not yet found AND not remote
+            potential_postcode = sanitize_postcode(part)
+            if potential_postcode:
+                postcode_raw = potential_postcode; is_remote = 0; processed_indices.add(i)
+                logger.debug(f"MJA Parse ({booking_id}): Found Postcode in part '{part}' -> {postcode_raw}")
+                break
+                
+    if postcode_raw is None and not is_remote: # If no postcode and not explicitly remote
+        is_remote = 1; logger.debug(f"MJA Parse ({booking_id}): No postcode found, inferred isRemote=1.")
+
+    # 3. Assign Language Pair (last remaining unprocessed part)
+    remaining_parts_for_lang = [parts[i] for i in range(len(parts)) if i not in processed_indices]
+    if remaining_parts_for_lang:
+        language_pair = remaining_parts_for_lang[-1]
+        logger.debug(f"MJA Parse ({booking_id}): Assigned Language Pair: '{language_pair}' from remaining: {remaining_parts_for_lang}")
+        if len(remaining_parts_for_lang) > 1:
+             logger.warning(f"MJA Parse ({booking_id}): Multiple unassigned parts left: {remaining_parts_for_lang[:-1]}. Using last for lang.")
+    else: logger.debug(f"MJA Parse ({booking_id}): No remaining parts for language pair.")
+
+    parsed_result = {
+        "booking_id": booking_id, "card_status": card_status, "postcode": postcode_raw,
+        "start_time_raw": start_time_raw, "end_time_raw": end_time_raw,
+        "calculated_duration_str": calculated_duration_str, "language_pair": language_pair,
+        "isRemote": is_remote, "original_duration_str": original_duration_str
+    }
+    logger.info(f"MJA Parse ({booking_id}): Final parsed data: {parsed_result}")
+    return parsed_result
+
