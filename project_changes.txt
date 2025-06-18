@@ -1,0 +1,37 @@
+Project Change History & Logic
+This document outlines the iterative changes made to the wordsynk_automata project to resolve issues identified during test runs.
+
+Iteration 1: Resolving KeyError: 'pageLoad'
+Problem: The initial run of the program terminated with a KeyError: 'pageLoad' when the scraper was processing the detail page of a booking.
+Analysis: The error was traced to the is_displayed method within pages/detail_page.py. The line initial_wait_time = self.driver.timeouts.implicit_wait was causing the issue. This indicated an incompatibility between the Selenium client library, which expected a 'pageLoad' key in the driver's timeout configuration, and the Appium server, which was not providing it. The previous, working version of this method used a safer WebDriverWait pattern.
+Solution Implemented:
+The file pages/detail_page.py was updated.
+The is_displayed method was reverted to its previous, more robust implementation which uses an explicit WebDriverWait to check for an element's presence instead of directly accessing and manipulating the driver's implicit wait timeouts. This avoided the problematic API call that caused the crash.
+Iteration 2: Resolving NameError and Refactoring Time Utilities
+Problem: After fixing the KeyError, a subsequent run failed with a NameError: name '_parse_time_str_to_datetime' is not defined inside parsers/detail_parser.py.
+Analysis: The functions _parse_time_str_to_datetime and _calculate_duration_str were being called in parsers/detail_parser.py but were only defined as internal helper functions within parsers/mja_parser.py. This violated scope and was not good practice for shared utility functions.
+Solution Implemented:
+Refactoring for DRY Principle: Following best practices, a new utility module was created at utils/time_utils.py.
+Centralizing Functions: The two time-related helper functions were moved from parsers/mja_parser.py to the new utils/time_utils.py.
+Improving API Design: The leading underscore was removed from the function names (e.g., _parse_time_str_to_datetime became parse_datetime_from_time_string) to indicate they are part of a public utility API.
+Code Updates:
+parsers/mja_parser.py was updated to import and use these functions from the new utils.time_utils module.
+parsers/detail_parser.py was also updated to import and use these functions from the new central location, resolving the NameError.
+Iteration 3: Fixing Multi-day Data Integrity and Scraper Inefficiency
+Problem: A review of the database state (GetAllBookings.json) and a new run log (main_output.txt) revealed two major regressions:
+Incomplete Data: Individual day records (MJAs) for multi-day bookings (MJRs) were missing critical data like booking_date and all day_pay_... financial details.
+Inefficiency: The scraper was repeatedly processing the same multi-day detail page every time it encountered a different MJA card belonging to that same parent MJR.
+Analysis:
+Data Integrity Failure: The root cause was a key mismatch. The DetailProcessor was preparing per-day data dictionaries with the MJA key as 'mja', but the save_booking_details function in db/repository.py expected it to be 'mja_id', causing the save operation to fail for multi-day sub-items. This also prevented the correctly calculated daily booking dates and payment details from being persisted.
+Efficiency Failure: The ListProcessor lacked a robust mechanism to check if a parent MJR had already been fully scraped within the current session. It was only checking for previously clicked MJA IDs.
+Solution Implemented: A comprehensive refactoring across the processors, parsers, and db layers was performed.
+parsers/detail_parser.py: The logic was improved to more reliably parse per-day payment blocks and calculate the booking_date for each entry in a multi-day booking.
+processors/detail_processor.py:
+Corrected the construction of the data dictionary passed to the save function, ensuring the key is now correctly 'mja_id'.
+Added logic to signal to the ListProcessor when an entire MJR has been successfully scraped by adding its ID to a session-wide set (session_fully_processed_mjr_ids).
+processors/list_processor.py:
+The logic was enhanced to use the new session_fully_processed_mjr_ids set. Before clicking a card, it now checks if the card's parent MJR has already been fully processed in the current session and skips it if so, preventing redundant work.
+A persistent AttributeError in a logging statement was also fixed.
+db/repository.py:
+The save_booking_details function was updated to be more robust.
+New helper functions (get_mjr_id_for_mja, check_if_all_mjas_for_mjr_scraped, update_all_mja_statuses_for_mjr) were added to support the new data integrity and efficiency logic by allowing processors to query the status of an entire MJR.

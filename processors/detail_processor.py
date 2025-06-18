@@ -3,16 +3,18 @@ import sqlite3
 import time
 from logger import get_logger
 from pages.detail_page import DetailPage
-from state.models import ScrapeState
+from state.models import ScrapeState, BookingProcessingStatus # Added BookingProcessingStatus
 from state.manager import StateManager
 from parsers.detail_parser import (
-    parse_detail_data, _extract_texts_from_xml, # Removed check_if_multiday_from_xml as it's not used here directly
+    parse_detail_data, _extract_texts_from_xml,
     extract_header_and_booking_type, extract_info_block,
     extract_mja_payment_blocks, extract_notes_and_total
 )
 from db.repository import (
     save_booking_details, update_booking_status,
-    get_secondary_hints_for_mjr, update_hints_for_mjr
+    get_secondary_hints_for_mjr, update_hints_for_mjr, # Ensure this is used correctly
+    get_mjr_id_for_mja, # New import for efficiency
+    update_all_mja_statuses_for_mjr # New import for efficiency
 )
 from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
 from selenium.webdriver.support.wait import WebDriverWait
@@ -25,6 +27,7 @@ from utils.xml_dumper import save_xml_dump
 
 if TYPE_CHECKING:
     from services.crawler_service import CrawlerService
+    from processors.list_processor import ListProcessor # For type hinting list_processor
 
 logger = get_logger(__name__)
 
@@ -36,118 +39,81 @@ class DetailProcessor:
         self.state_manager = state_manager
         self.target_display_id_str = target_display_id
         self.crawler_service = crawler_service
-        self.current_scrape_attempt = 1 # Default, should be updated from state_manager if resuming
+        # self.current_scrape_attempt = 1 # Managed by state_manager now
         self.disclaimer_selector = 'new UiSelector().textStartsWith("By accepting this assignment")'
-        self.max_scrolls = 7 # Max scrolls to find disclaimer or end of content
-        self.list_page_container_selector = '//androidx.recyclerview.widget.RecyclerView' # Used for back navigation check
+        self.max_scrolls = 7 
+        self.list_page_container_selector = '//androidx.recyclerview.widget.RecyclerView'
 
     def _navigate_back_to_list(self) -> ScrapeState:
+        # ... (Same as previous version, seems okay) ...
         try:
             logger.info("Navigating back to list page (Detail -> Secondary -> List)...")
-            # First back: Detail to Secondary
-            logger.debug("Executing first back() command.")
-            self.driver.back()
-            time.sleep(0.8) # Allow time for transition
-
-            # Second back: Secondary to List
-            logger.debug("Executing second back() command.")
-            self.driver.back()
-            time.sleep(1.2) # Allow time for transition
-
-            # Confirm back on list page
+            logger.debug("Executing first back() command."); self.driver.back(); time.sleep(0.8) 
+            logger.debug("Executing second back() command."); self.driver.back(); time.sleep(1.2)
             try:
-                WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_element_located((AppiumBy.XPATH, self.list_page_container_selector))
-                )
+                WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((AppiumBy.XPATH, self.list_page_container_selector)))
                 logger.info("Navigation successful: Confirmed back on list page.")
             except TimeoutException:
-                logger.warning("Did not confirm list page after two back() commands. Trying one more.")
-                try:
-                    self.driver.back()
-                    time.sleep(1.5)
-                    WebDriverWait(self.driver, 5).until(
-                        EC.presence_of_element_located((AppiumBy.XPATH, self.list_page_container_selector))
-                    )
-                    logger.info("Confirmed back on list page after third back().")
-                except Exception as final_nav_e:
-                    logger.error(f"Still not on list page after third back(). Error: {final_nav_e}")
-                    # Even if not confirmed, proceed to update state to LIST and let ListProcessor re-evaluate
-            
+                logger.warning("Did not confirm list page after two back(). Trying one more.")
+                try: self.driver.back(); time.sleep(1.5); WebDriverWait(self.driver, 5).until(EC.presence_of_element_located((AppiumBy.XPATH, self.list_page_container_selector))); logger.info("Confirmed back on list page after third back().")
+                except: logger.error("Still not on list page after third back().")
             self.state_manager.update_state(ScrapeState.LIST, current_booking_id=None, current_mjr_id=None)
             return ScrapeState.LIST
-
-        except Exception as nav_e:
+        except Exception as nav_e: 
             logger.exception(f"Failed during back navigation: {nav_e}")
-            # Update state to error, but also attempt to set it to LIST to try recovery from there
             self.state_manager.update_state(ScrapeState.ERROR, error_message=f"Back navigation failed: {nav_e}")
-            # self.state_manager.update_state(ScrapeState.LIST, current_booking_id=None, current_mjr_id=None) # Or attempt LIST
             return ScrapeState.ERROR
 
 
     def _is_disclaimer_visible(self) -> bool:
-        try:
-            WebDriverWait(self.driver, 0.2).until( # Very short timeout for a quick check
-                EC.presence_of_element_located((AppiumBy.ANDROID_UIAUTOMATOR, self.disclaimer_selector))
-            )
-            return True
-        except TimeoutException:
-            return False
-        except Exception: # Catch any other error during check
-            return False
+        # ... (Same as previous version) ...
+        try: WebDriverWait(self.driver, 0.2).until(EC.presence_of_element_located((AppiumBy.ANDROID_UIAUTOMATOR, self.disclaimer_selector))); return True
+        except: return False
 
     def _apply_display_setting(self):
-        if self.target_display_id_str == "0" or not self.target_display_id_str:
-            return
-        try:
-            self.driver.update_settings({"displayId": int(self.target_display_id_str)})
-        except ValueError:
-            logger.warning(f"Target display ID '{self.target_display_id_str}' not an int.")
-        except Exception as e:
-            logger.error(f"Failed to apply displayId setting: {e}")
+        # ... (Same as previous version) ...
+        if self.target_display_id_str == "0" or not self.target_display_id_str: return
+        try: self.driver.update_settings({"displayId": int(self.target_display_id_str)})
+        except ValueError: logger.warning(f"Target display ID '{self.target_display_id_str}' not an int.")
+        except Exception as e: logger.error(f"Failed to apply displayId setting: {e}")
 
     def _get_current_texts_and_source(self) -> Tuple[List[str], str]:
-        page_source = ""
-        texts: List[str] = []
+        # ... (Same as previous version) ...
+        page_source = ""; texts = []
         try:
-            self._apply_display_setting() # Ensure correct display is targeted
+            self._apply_display_setting()
             page_source = self.driver.page_source
-            if not page_source:
-                logger.error("Failed to get page source for detail page.")
-                return [], ""
+            if not page_source: logger.error("Failed to get page source for detail page."); return [], ""
             texts = _extract_texts_from_xml(page_source)
-        except Exception as e:
-            logger.exception(f"Unexpected error getting page source/texts: {e}")
+        except Exception as e: logger.exception(f"Unexpected error getting page source/texts: {e}")
         return texts, page_source
 
     def process(self) -> ScrapeState:
-        current_mja_in_state = self.state_manager.current_booking_id
+        current_mja_in_state = self.state_manager.current_booking_id # MJA that led us here
         current_mjr_from_state = self.state_manager.current_mjr_id
-        logger.info(f"Processing State: DETAIL (Display {self.target_display_id_str}, MJA: {current_mja_in_state}, MJR: {current_mjr_from_state})")
+        logger.info(f"Processing State: DETAIL (Display {self.target_display_id_str}, MJA_trigger: {current_mja_in_state}, MJR: {current_mjr_from_state})")
         
-        # MODIFIED: Use wait_until_displayed for a more robust check immediately
         try:
-            self.det_page.wait_until_displayed(timeout=10) # Increased timeout for initial page confirmation
+            self.det_page.wait_until_displayed(timeout=10)
             logger.info(f"Successfully confirmed on Detail Page for MJR {current_mjr_from_state}")
         except TimeoutException:
-            logger.error(f"Failed to confirm Detail Page for MJR {current_mjr_from_state} even after 10s. Resetting to NAVIGATING_TO_LIST.")
-            self.state_manager.update_state(ScrapeState.NAVIGATING_TO_LIST, current_booking_id=None, current_mjr_id=None, error_message="Detail page not found")
-            return ScrapeState.NAVIGATING_TO_LIST # Or ScrapeState.ERROR directly if NAVIGATING_TO_LIST is problematic
+            logger.error(f"Failed to confirm Detail Page for MJR {current_mjr_from_state}. Resetting.")
+            self.state_manager.update_state(ScrapeState.NAVIGATING_TO_LIST, current_booking_id=None, current_mjr_id=None, error_message="Detail page not found after nav")
+            return ScrapeState.NAVIGATING_TO_LIST
         except Exception as page_load_e:
             logger.exception(f"Unexpected error confirming detail page: {page_load_e}")
             self.state_manager.update_state(ScrapeState.ERROR, current_booking_id=current_mja_in_state, current_mjr_id=current_mjr_from_state, error_message=f"Detail page load error: {page_load_e}")
             return ScrapeState.ERROR
 
-
         header_info: Dict[str, Any] = {}
         info_block: Dict[str, Any] = {}
-        all_mja_blocks: List[Dict[str, Any]] = []
+        all_mja_blocks_raw: List[Dict[str, Any]] = [] # Raw blocks from parser
         notes_total_info: Dict[str, Any] = {}
         is_multiday = False
         lang_idx: Optional[int] = None
-        mjr_id_final = current_mjr_from_state # Initialize with state
+        mjr_id_final = current_mjr_from_state 
 
         try:
-            # Page is now confirmed, proceed with extraction
             initial_texts, initial_page_source = self._get_current_texts_and_source()
             if not initial_page_source:
                 raise ValueError("Failed to get initial page source from detail page after confirmation.")
@@ -158,174 +124,181 @@ class DetailProcessor:
             if parsed_mjr_from_header:
                 if mjr_id_final and mjr_id_final != parsed_mjr_from_header:
                     logger.warning(f"State MJR ({mjr_id_final}) != Parsed MJR from header ({parsed_mjr_from_header}). Using state MJR.")
-                elif not mjr_id_final: # If state didn't have MJR, use the one from header
+                elif not mjr_id_final: 
                     mjr_id_final = parsed_mjr_from_header
             
-            if not mjr_id_final: # Fallback if still no MJR ID
-                mjr_id_final = current_mja_in_state if current_mja_in_state else "UNKNOWN_DETAIL_ID"
-            
-            logger.info(f"Initial Check: IsMultiday={is_multiday}, MJR ID='{mjr_id_final}'")
+            if not mjr_id_final: 
+                 # If still no mjr_id_final, try to get it from the DB using current_mja_in_state
+                if current_mja_in_state:
+                    mjr_id_final = get_mjr_id_for_mja(self.conn, current_mja_in_state)
+                    if mjr_id_final:
+                        logger.info(f"Retrieved MJR ID {mjr_id_final} from DB for MJA {current_mja_in_state}")
+                    else: # Fallback if MJA not in DB or has no MJR yet
+                        mjr_id_final = current_mja_in_state # Less ideal, but an identifier
+                        logger.warning(f"Could not determine MJR ID from state or header, using MJA {current_mja_in_state} as fallback ID.")
+                else: # No MJA trigger, no header MJR - this is problematic
+                    mjr_id_final = "UNKNOWN_MJR_DETAIL"
+                    logger.error("MJR ID could not be determined for Detail Page processing.")
+
+
+            logger.info(f"Processing Detail for MJR: '{mjr_id_final}', IsMultiday={is_multiday}")
 
             if DUMP_XML_MODE:
                 save_xml_dump(initial_page_source, "Detail_MJR", mjr_id_final, sequence_or_stage="initial_view_00")
 
-            if lang_idx is None: # Language text is a critical anchor for info_block
-                raise ValueError(f"Critical language anchor text not found in initial texts for MJR {mjr_id_final}.")
+            if lang_idx is None: 
+                raise ValueError(f"Critical language anchor text not found for MJR {mjr_id_final}.")
             
             info_block = extract_info_block(initial_texts, lang_idx)
 
-            logger.info("Starting scroll loop for payments...")
+            # --- Scroll loop to gather all payment blocks ---
             scroll_count = 0
             last_page_source_for_comparison = initial_page_source
-            processed_mja_ids_in_this_detail_view = set() # Track MJAs seen in this specific detail page view
+            # No need for processed_mja_ids_in_this_detail_view, extract_mja_payment_blocks will return all it finds
+            
+            # Initial extraction before any scrolling
+            all_mja_blocks_raw = extract_mja_payment_blocks(initial_texts)
 
-            # Scroll loop to gather all payment blocks
-            while scroll_count < self.max_scrolls:
-                current_texts_loop, current_page_source_loop = self._get_current_texts_and_source()
-                if not current_page_source_loop:
-                    logger.warning("Empty page source in scroll loop. Breaking scroll.")
-                    break
-                
-                if DUMP_XML_MODE and scroll_count > 0: # Dump subsequent scrolls
-                    save_xml_dump(current_page_source_loop, "Detail_MJR", mjr_id_final, sequence_or_stage=f"scroll_{scroll_count:02d}")
+            if not self._is_disclaimer_visible() and not (is_multiday and len(all_mja_blocks_raw) >= header_info.get('appointment_count_hint', 1)): # Only scroll if needed
+                logger.info("Starting scroll loop for more payments or disclaimer...")
+                while scroll_count < self.max_scrolls:
+                    current_texts_loop, current_page_source_loop = self._get_current_texts_and_source()
+                    if not current_page_source_loop: logger.warning("Empty page source in scroll loop."); break
+                    
+                    if DUMP_XML_MODE and scroll_count >= 0: # Dump first scroll attempt too
+                        save_xml_dump(current_page_source_loop, "Detail_MJR", mjr_id_final, sequence_or_stage=f"scroll_{scroll_count+1:02d}")
 
-                current_mja_blocks_from_loop = extract_mja_payment_blocks(current_texts_loop)
-                new_blocks_found_this_scroll = False
-                for block in current_mja_blocks_from_loop:
-                    mja_id_from_block = block.get('mja')
-                    # For multiday, add if MJA ID is new. For single day (mja_id_from_block is None), add if no block is already present.
-                    if mja_id_from_block and mja_id_from_block not in processed_mja_ids_in_this_detail_view:
-                        all_mja_blocks.append(block)
-                        processed_mja_ids_in_this_detail_view.add(mja_id_from_block)
-                        new_blocks_found_this_scroll = True
-                        logger.info(f"  Added new MJA block: {mja_id_from_block}")
-                    elif not mja_id_from_block and not any(b.get('mja') is None for b in all_mja_blocks): # Single day payment fragment
-                        all_mja_blocks.append(block)
-                        new_blocks_found_this_scroll = True
-                        logger.info("  Added single day payment fragment block.")
-                
-                if self._is_disclaimer_visible():
-                    logger.info(f"Disclaimer found after {scroll_count} scrolls.")
-                    break
-                
-                # Check if page source has changed to prevent infinite loops on static pages
-                if current_page_source_loop == last_page_source_for_comparison and scroll_count > 0 and not new_blocks_found_this_scroll:
-                    logger.warning("Page source unchanged after scroll and no new MJA blocks found. Breaking scroll.")
-                    break
-                last_page_source_for_comparison = current_page_source_loop
-                
-                logger.debug("Scrolling detail page...")
-                size = self.driver.get_window_size()
-                start_x = size['width'] // 2
-                start_y = int(size['height'] * 0.7)
-                end_y = int(size['height'] * 0.3)
-                try:
-                    self.driver.swipe(start_x, start_y, start_x, end_y, 800)
-                    time.sleep(1.5) # Wait for content to load after swipe
-                except Exception as e_swipe:
-                    logger.error(f"Swipe error: {e_swipe}. Breaking scroll.")
-                    break
-                scroll_count += 1
-            else: # Loop finished due to max_scrolls
-                if not self._is_disclaimer_visible():
-                    logger.warning(f"Max scrolls ({self.max_scrolls}) reached, disclaimer still not visible.")
+                    # Re-extract MJA blocks from the new view and merge/replace if more complete
+                    # For simplicity, let's assume extract_mja_payment_blocks gets everything visible.
+                    # A more robust approach would merge based on MJA IDs if blocks get split by scrolling.
+                    # Current extract_mja_payment_blocks re-parses the whole visible text.
+                    all_mja_blocks_raw = extract_mja_payment_blocks(current_texts_loop) 
+                                        
+                    if self._is_disclaimer_visible():
+                        logger.info(f"Disclaimer found after {scroll_count + 1} scrolls.")
+                        break
+                    
+                    if current_page_source_loop == last_page_source_for_comparison and scroll_count > 0:
+                        logger.warning("Page source unchanged after scroll. Breaking scroll.")
+                        break
+                    last_page_source_for_comparison = current_page_source_loop
+                    
+                    logger.debug(f"Scrolling detail page (attempt {scroll_count + 1})...");
+                    size = self.driver.get_window_size(); start_x=size['width']//2
+                    start_y=int(size['height']*0.7); end_y=int(size['height']*0.3)
+                    try: self.driver.swipe(start_x, start_y, start_x, end_y, 800); time.sleep(1.5)
+                    except Exception as e_swipe: logger.error(f"Swipe error: {e_swipe}."); break
+                    scroll_count += 1
+                else:
+                    if not self._is_disclaimer_visible():
+                        logger.warning(f"Max scrolls ({self.max_scrolls}) reached, disclaimer not visible.")
+            else:
+                 logger.info("Skipping scroll loop: Disclaimer visible initially or all expected MJA blocks for multiday found.")
 
-            # Get final texts for notes and total after all scrolling
-            final_texts, final_page_source_for_dump = self._get_current_texts_and_source()
-            if DUMP_XML_MODE and final_page_source_for_dump and final_page_source_for_dump != last_page_source_for_comparison and scroll_count > 0:
+
+            final_texts_for_notes, final_page_source_for_dump = self._get_current_texts_and_source() # Get final state for notes
+            if DUMP_XML_MODE and final_page_source_for_dump and final_page_source_for_dump != last_page_source_for_comparison and scroll_count > 0 :
                  save_xml_dump(final_page_source_for_dump, "Detail_MJR", mjr_id_final, sequence_or_stage=f"final_view_{scroll_count:02d}")
             
-            if final_texts:
-                notes_total_info = extract_notes_and_total(final_texts)
+            if final_texts_for_notes:
+                notes_total_info = extract_notes_and_total(final_texts_for_notes)
             else:
-                logger.error("Failed to get final texts for notes/total extraction.")
-                # Fallback: try to extract from last known good texts if final_texts failed
-                if last_page_source_for_comparison == initial_page_source:
-                    notes_total_info = extract_notes_and_total(initial_texts)
-                else: # If scrolled, this is harder to recover, but try with last scrolled texts
-                    temp_texts_for_notes, _ = self._get_current_texts_and_source() # Re-fetch in case it works now
-                    notes_total_info = extract_notes_and_total(temp_texts_for_notes if temp_texts_for_notes else initial_texts)
-
+                logger.error("Failed to get final texts for notes/total extraction. Using initial texts as fallback.")
+                notes_total_info = extract_notes_and_total(initial_texts)
 
             logger.info("Consolidating all extracted data...")
-            parsed_data = parse_detail_data(header_info, is_multiday, info_block, all_mja_blocks, notes_total_info)
-            logger.debug(f"Final Parsed Data (day_total: {parsed_data.get('day_total')}): {str(parsed_data)[:1000]}...")
+            # Pass all_mja_blocks_raw which contains all MJA payment dicts found on the page
+            parsed_mjr_data = parse_detail_data(header_info, is_multiday, info_block, all_mja_blocks_raw, notes_total_info)
+            
+            # Ensure mjr_id_final is the one from the parsed data if available, otherwise stick to earlier determination
+            mjr_id_final = parsed_mjr_data.get('mjr_id', mjr_id_final)
+            if not mjr_id_final or mjr_id_final == "UNKNOWN_MJR_DETAIL":
+                 raise ValueError(f"MJR ID is still unknown after full parsing for MJA trigger {current_mja_in_state}.")
 
-            if not mjr_id_final or mjr_id_final == "UNKNOWN_DETAIL_ID": # Re-check mjr_id after full parsing
-                 mjr_id_final = parsed_data.get('mjr_id')
-                 if not mjr_id_final:
-                     raise ValueError(f"MJR ID is still unknown after full parsing for MJA {current_mja_in_state}.")
+            logger.debug(f"Final Parsed MJR Data for {mjr_id_final} (is_multiday: {is_multiday}): {str(parsed_mjr_data)[:1000]}...")
 
             if is_multiday:
                 logger.info(f"Processing MULTIDAY save for MJR ID: {mjr_id_final}")
-                multiday_payments_parsed = parsed_data.get('multiday_payments', [])
-                if not multiday_payments_parsed:
-                    logger.warning(f"Multiday booking MJR {mjr_id_final}, but no MJA payment blocks parsed/found.")
-                    if current_mja_in_state: # Update status of the MJA that led here
-                        update_booking_status(self.conn, current_mja_in_state, 'error_detail_extract', f"Multiday MJR {mjr_id_final} no MJA payment blocks parsed")
+                multiday_payment_entries = parsed_mjr_data.get('multiday_payments', []) # This list now contains dicts with full data for each MJA day
+                
+                if not multiday_payment_entries:
+                    logger.warning(f"Multiday booking MJR {mjr_id_final}, but no MJA payment entries derived by parser.")
+                    # This might be an error if appointment_count_hint > 0
+                    if current_mja_in_state:
+                        update_booking_status(self.conn, current_mja_in_state, BookingProcessingStatus.ERROR_DETAIL_EXTRACT.value, f"Multiday MJR {mjr_id_final} no MJA payment entries")
                 else:
-                    logger.info(f"Saving {len(multiday_payments_parsed)} MJA payment blocks for MJR {mjr_id_final}.")
-                    for i, day_specific_data in enumerate(multiday_payments_parsed):
-                        mja_id_from_day_block = day_specific_data.get('mja')
-                        if not mja_id_from_day_block:
-                            logger.warning(f"Skipping a day payment block for MJR {mjr_id_final} due to missing MJA ID in block {i+1}.")
+                    logger.info(f"Saving {len(multiday_payment_entries)} MJA entries for MJR {mjr_id_final}.")
+                    all_mjas_for_this_mjr_saved = True
+                    for mja_day_data in multiday_payment_entries:
+                        mja_id_for_this_day = mja_day_data.get('mja')
+                        if not mja_id_for_this_day:
+                            logger.error(f"Multiday entry for MJR {mjr_id_final} is missing MJA identifier. Data: {mja_day_data}")
+                            all_mjas_for_this_mjr_saved = False
                             continue
-                        
-                        booking_data_for_day = {
-                            'mja_id': mja_id_from_day_block, 'mjr_id': mjr_id_final,
-                            'processing_id': mjr_id_final, 'is_multiday': 1,
-                            'appointment_sequence': i + 1,
-                            'language_pair': parsed_data.get('language_pair'),
-                            'client_name': parsed_data.get('client_name'),
-                            'address': parsed_data.get('address'),
-                            'booking_type': parsed_data.get('booking_type'),
-                            'contact_name': parsed_data.get('contact_name'),
-                            'contact_phone': parsed_data.get('contact_phone'),
-                            'travel_distance': parsed_data.get('travel_distance'), # MJR-level travel
-                            'meeting_link': parsed_data.get('meeting_link'),
-                            'notes': parsed_data.get('notes'), # MJR-level notes
-                            'overall_total': parsed_data.get('overall_total'), # MJR-level total
-                            'booking_date': day_specific_data.get('booking_date'),
-                            'start_time': day_specific_data.get('start_time'), # Per-day if available
-                            'end_time': day_specific_data.get('end_time'),     # Per-day if available
-                            'duration': day_specific_data.get('duration'),   # Per-day if available
-                            **{f'day_pay_{k}': v for k, v in day_specific_data.items() if k.startswith('pay_')}, # All day_pay_ items
-                            'day_total': parsed_data.get('day_total'), # Average day total for the MJR
-                            'status': 'scraped', 'scrape_attempt': self.state_manager.current_scrape_attempt
+
+                        # Merge common MJR data with specific MJA day data
+                        db_record = {
+                            **{k: v for k, v in parsed_mjr_data.items() if k not in ['multiday_payments', 'day_pay_sl', 'day_pay_td', 'day_pay_tt', 'day_pay_aep', 'day_pay_ooh', 'day_pay_urg', 'day_total', 'mja_id']}, # common MJR fields
+                            **mja_day_data, # Per-MJA fields (mja, booking_date, day_pay_*, day_total for this MJA)
+                            'mjr_id': mjr_id_final, # Ensure mjr_id is set
+                            'processing_id': mjr_id_final,
+                            'is_multiday': 1,
+                            # appointment_sequence should be derived by ListProcessor based on card order or by db query
+                            'status': BookingProcessingStatus.SCRAPED.value,
+                            'scrape_attempt': self.state_manager.current_scrape_attempt
                         }
-                        save_booking_details(self.conn, booking_data_for_day, attempt_count=self.state_manager.current_scrape_attempt)
+                        # appointment_sequence might need to be set based on index in loop if not in mja_day_data
+                        if 'appointment_sequence' not in db_record or db_record['appointment_sequence'] is None:
+                             db_record['appointment_sequence'] = multiday_payment_entries.index(mja_day_data) + 1
+
+
+                        try:
+                            save_booking_details(self.conn, db_record, attempt_count=self.state_manager.current_scrape_attempt)
+                        except Exception as save_exc:
+                            all_mjas_for_this_mjr_saved = False
+                            logger.error(f"Failed to save MJA day {mja_id_for_this_day} for MJR {mjr_id_final}: {save_exc}")
+                            update_booking_status(self.conn, mja_id_for_this_day, BookingProcessingStatus.ERROR_SAVE.value, str(save_exc)[:200])
                     
-                    # Update hints for all MJA_IDs part of this MJR
-                    hints = get_secondary_hints_for_mjr(self.conn, mjr_id_final) # Get hints from one of the MJAs (ideally the first)
-                    if hints:
-                        update_hints_for_mjr(self.conn, mjr_id_final, hints[0], hints[1])
-                    else:
-                        logger.warning(f"Could not retrieve hints for MJR {mjr_id_final} to apply to all its MJA parts.")
+                    if all_mjas_for_this_mjr_saved:
+                        logger.info(f"All MJA days for MJR {mjr_id_final} processed.")
+                        # Mark this MJR as fully processed for this session to improve efficiency
+                        if self.crawler_service:
+                            list_processor: Optional['ListProcessor'] = self.crawler_service.processors.get(ScrapeState.LIST) #type: ignore
+                            if list_processor and hasattr(list_processor, 'session_fully_processed_mjr_ids'):
+                                list_processor.session_fully_processed_mjr_ids.add(mjr_id_final)
+                                logger.info(f"Marked MJR {mjr_id_final} as fully processed for this session (efficiency).")
+                        # Update status for all MJAs of this MJR if they were pending
+                        update_all_mja_statuses_for_mjr(self.conn, mjr_id_final, BookingProcessingStatus.SCRAPED.value)
+
             else: # Single Day
-                 mja_id_to_save = parsed_data.get('mja_id') or current_mja_in_state
+                 mja_id_to_save = parsed_mjr_data.get('mja_id') or current_mja_in_state # MJA ID for the single day booking
                  if not mja_id_to_save:
-                     raise ValueError(f"Cannot save single day for MJR {mjr_id_final} - MJA ID is missing.")
+                     raise ValueError(f"Cannot save single day for MJR {mjr_id_final} - MJA ID is missing from parsed data and state.")
                  
                  logger.info(f"Processing SINGLE DAY save for MJA: {mja_id_to_save} (MJR: {mjr_id_final})")
-                 single_day_booking_data = parsed_data.copy()
-                 single_day_booking_data['mja_id'] = mja_id_to_save
-                 single_day_booking_data['is_multiday'] = 0
-                 single_day_booking_data['appointment_sequence'] = 1
-                 single_day_booking_data['processing_id'] = mjr_id_final
-                 single_day_booking_data['status'] = 'scraped'
-                 single_day_booking_data['scrape_attempt'] = self.state_manager.current_scrape_attempt
-                 save_booking_details(self.conn, single_day_booking_data, attempt_count=self.state_manager.current_scrape_attempt)
+                 single_day_db_record = {
+                     **parsed_mjr_data, # Contains all necessary fields including day_pay_* and day_total
+                     'mja_id': mja_id_to_save, # Ensure it's the correct MJA ID
+                     'mjr_id': mjr_id_final,
+                     'processing_id': mjr_id_final,
+                     'is_multiday': 0,
+                     'appointment_sequence': 1,
+                     'status': BookingProcessingStatus.SCRAPED.value,
+                     'scrape_attempt': self.state_manager.current_scrape_attempt
+                 }
+                 del single_day_db_record['multiday_payments'] # Not applicable for single day
+                 save_booking_details(self.conn, single_day_db_record, attempt_count=self.state_manager.current_scrape_attempt)
             
-            self.state_manager.record_booking_scraped() # Increment session scrape count
+            self.state_manager.record_booking_scraped() 
             return self._navigate_back_to_list()
 
         except Exception as e:
-            logger.exception(f"Error processing detail page (MJR: {mjr_id_final or 'Unknown'} / MJA: {current_mja_in_state or 'Unknown'}): {e}")
-            error_message = f"Detail processing error: {str(e)[:200]}"
+            logger.exception(f"Error during detail page content processing (MJR: {mjr_id_final or 'Unknown'} / MJA_trigger: {current_mja_in_state or 'Unknown'}): {e}")
+            error_message = f"Detail content processing error: {str(e)[:200]}"
+            # Update status of the MJA that led to this detail page, if known
             if current_mja_in_state:
-                update_booking_status(self.conn, current_mja_in_state, 'error_detail_extract', error_message)
+                update_booking_status(self.conn, current_mja_in_state, BookingProcessingStatus.ERROR_DETAIL_EXTRACT.value, error_message)
             
-            # Attempt to navigate back regardless of error during processing, then set error state
             self._navigate_back_to_list() 
             self.state_manager.update_state(ScrapeState.ERROR, current_booking_id=current_mja_in_state, current_mjr_id=current_mjr_from_state, error_message=error_message)
             return ScrapeState.ERROR

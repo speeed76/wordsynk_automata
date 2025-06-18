@@ -3,9 +3,9 @@ import re
 import sys
 from typing import Optional, List, Dict, Any, Tuple
 import html
-from datetime import datetime, timedelta # Keep datetime for other date operations
+from datetime import datetime, timedelta
 from logger import get_logger
-from utils.time_utils import parse_datetime_from_time_string, calculate_duration_string # MODIFIED: Import from time_utils
+from utils.time_utils import parse_datetime_from_time_string, calculate_duration_string
 
 logger = get_logger(__name__)
 
@@ -31,13 +31,13 @@ TOTAL_TEXT = "TOTAL"
 URGENCY_TEXT = "Urgency"
 UPLIFT_TEXT = "Uplift"
 DISCLAIMER_START_TEXT = "By accepting this assignment"
-INFO_BLOCK_TERMINATORS = ["Timesheets Download", "", SL_TEXT, "Open Directions"]
+INFO_BLOCK_TERMINATORS = ["Timesheets Download", "", SL_TEXT, "Open Directions"] # Note: TOTAL_TEXT was removed as it can appear before MJA blocks
 PAYMENT_LABELS_MAP = {
     "service line item": "pay_sl", "travel distance line item": "pay_td",
     "travel time line item": "pay_tt", "automation enhancement payment": "pay_aep",
 }
-OOH_SUBSTRING = "uplift"
-URGENCY_SUBSTRING = "urgency"
+OOH_SUBSTRING = "uplift" # For "Out of Hours Uplift"
+URGENCY_SUBSTRING = "urgency" # For "Urgency Payment"
 
 def parse_money(raw_value: Optional[str]) -> Optional[float]:
     if raw_value is None or '£' not in raw_value:
@@ -96,12 +96,14 @@ def _extract_texts_from_xml(xml_content: str) -> List[str]:
     return texts
 
 def extract_header_and_booking_type(texts: List[str]) -> Tuple[Dict[str, Any], bool, Optional[int]]:
+    # (This function seems okay, assuming it correctly identifies is_multiday and multiday_date_range_raw)
+    # ... (previous implementation of extract_header_and_booking_type) ...
     header_data = {'mjr_id_raw': None, 'total_value_header_raw': None, 'date_time_raw_tuple': None, 'multiday_date_range_raw': None, 'multiday_appointment_count_raw': None}
     is_multiday = False
     lang_idx = -1
     mjr_id_idx = next((i for i, t in enumerate(texts) if t.startswith("Booking #MJR")), -1)
     multiday_idx = next((i for i, t in enumerate(texts) if t == MULTIDAY_TEXT), -1)
-    lang_idx = next((i for i, t in enumerate(texts) if t == LANGUAGE_TEXT), -1) # Assuming fixed language
+    lang_idx = next((i for i, t in enumerate(texts) if t == LANGUAGE_TEXT), -1) 
     if mjr_id_idx != -1:
         mjr_match = MJR_ID_PATTERN.search(texts[mjr_id_idx])
         header_data['mjr_id_raw'] = mjr_match.group(1) if mjr_match else texts[mjr_id_idx]
@@ -127,14 +129,16 @@ def extract_header_and_booking_type(texts: List[str]) -> Tuple[Dict[str, Any], b
     logger.debug(f"Header Results: MJR='{header_data['mjr_id_raw']}', Total='{header_data['total_value_header_raw']}', MultiDay={is_multiday}, LangIdx={lang_idx}, DateTimeTuple='{header_data['date_time_raw_tuple']}'")
     return header_data, is_multiday, lang_idx if lang_idx != -1 else None
 
+
 def extract_info_block(texts: List[str], lang_idx: int) -> Dict[str, Any]:
+    # ... (previous implementation of extract_info_block - assuming this part is largely correct for common data) ...
     info_data = {k: None for k in ['language_pair_raw', 'client_name_raw', 'address_line1_raw', 'address_line2_raw', 'booking_type_raw', 'contact_name_raw', 'contact_phone_raw', 'distance_raw', 'meeting_link_raw']}
     if lang_idx == -1 or lang_idx >= len(texts):
         logger.error(f"Invalid Language index ({lang_idx})")
         return info_data
     info_data['language_pair_raw'] = texts[lang_idx]
     start_processing_idx = lang_idx + 1
-    payment_start_idx = len(texts)
+    payment_start_idx = len(texts) 
     for i, t in enumerate(texts[start_processing_idx:], start=start_processing_idx):
         if MJA_REF_PATTERN.match(t) or t in INFO_BLOCK_TERMINATORS:
             payment_start_idx = i
@@ -186,7 +190,7 @@ def extract_info_block(texts: List[str], lang_idx: int) -> Dict[str, Any]:
             logger.debug(f"  Contact Name: '{info_data['contact_name_raw']}'")
     if ptr < len(potential_info_texts) and not info_data.get('contact_phone_raw'):
         candidate = potential_info_texts[ptr]
-        if not DISTANCE_PATTERN.search(candidate):
+        if not DISTANCE_PATTERN.search(candidate): # Allow anything that is not distance as phone
             info_data['contact_phone_raw'] = candidate
             ptr += 1
             logger.debug(f"  Contact Phone: '{info_data['contact_phone_raw']}'")
@@ -204,52 +208,73 @@ def extract_info_block(texts: List[str], lang_idx: int) -> Dict[str, Any]:
     logger.debug(f"Finished parsing info block: {info_data}")
     return info_data
 
+
 def extract_mja_payment_blocks(texts: List[str]) -> List[Dict[str, Any]]:
     mja_payment_blocks = []
     mja_indices = [i for i, t in enumerate(texts) if MJA_REF_PATTERN.match(t)]
-    if not mja_indices:
-        sl_idx = next((i for i, t in enumerate(texts) if t == SL_TEXT), -1)
+
+    if not mja_indices: # Handle single day booking without explicit MJA prefix (unlikely for payment blocks)
+        # This case assumes payment items (SL_TEXT etc.) appear directly if no MJA refs
+        sl_idx = next((i for i,t in enumerate(texts) if t == SL_TEXT), -1)
         if sl_idx != -1:
-            single_day_payments = {'mja': None}
-            current_idx = sl_idx
-            total_idx = next((i for i, t in enumerate(texts[current_idx:], start=current_idx) if t == TOTAL_TEXT), len(texts))
-            if current_idx + 1 < total_idx:
-                idx = current_idx + 1
-                while idx < total_idx:
-                    if idx + 1 < total_idx:
-                        label_text = texts[idx]
-                        value_text = texts[idx+1]
-                        label_lower = label_text.lower()
-                        if value_text.startswith('£'):
-                            pay_key = PAYMENT_LABELS_MAP.get(label_lower)
-                            if pay_key:
-                                single_day_payments[pay_key] = value_text
-                            elif URGENCY_SUBSTRING in label_lower:
-                                single_day_payments['pay_urg'] = value_text
-                            elif OOH_SUBSTRING in label_lower and 'pay_ooh' not in single_day_payments:
-                                single_day_payments['pay_ooh'] = value_text
-                        idx += 2
-                    else:
-                        idx +=1
-            if len(single_day_payments) > 1:
+            logger.debug("No MJA refs found, looking for a single payment block starting with Service Line Item.")
+            single_day_payments = {'mja': None} # MJA ID will be from header for single day cases
+            # Payment items for this single block end at TOTAL_TEXT or end of list
+            block_end_idx = next((k for k, t_val in enumerate(texts[sl_idx:], start=sl_idx) if t_val == TOTAL_TEXT), len(texts))
+            
+            idx = sl_idx # Start from SL_TEXT itself
+            while idx < block_end_idx:
+                if idx + 1 < block_end_idx: # Need a label and a value
+                    label_text = texts[idx]
+                    value_text = texts[idx+1]
+                    label_lower = label_text.lower()
+                    
+                    if value_text.startswith('£'): # Check if value is a monetary amount
+                        pay_key = PAYMENT_LABELS_MAP.get(label_lower)
+                        if pay_key:
+                            single_day_payments[pay_key] = value_text
+                        elif URGENCY_SUBSTRING in label_lower:
+                            single_day_payments['pay_urg'] = value_text
+                        elif OOH_SUBSTRING in label_lower and 'pay_ooh' not in single_day_payments: # Avoid overwriting if multiple uplifts
+                            single_day_payments['pay_ooh'] = value_text
+                        idx += 2 # Move past label and value
+                    else: # Value is not '£...', might be end of useful pairs for this item type
+                        idx += 1
+                else: # No pair left
+                    idx += 1
+            if len(single_day_payments) > 1 : # Only add if actual payment items found besides 'mja': None
                 mja_payment_blocks.append(single_day_payments)
+        else:
+            logger.debug("No MJA references or Service Line Item found to indicate payment blocks.")
         return mja_payment_blocks
-    for i, start_idx in enumerate(mja_indices):
-        if start_idx >= len(texts):
-            continue
-        mja_ref = texts[start_idx]
+
+    # Process blocks for each MJA found (multi-day scenario)
+    logger.debug(f"Found {len(mja_indices)} MJA references for potential payment blocks.")
+    for i, current_mja_start_idx in enumerate(mja_indices):
+        mja_ref = texts[current_mja_start_idx]
         payment_details = {'mja': mja_ref}
-        end_idx = mja_indices[i+1] if i + 1 < len(mja_indices) else len(texts)
-        total_idx_after_mja = next((idx for idx, t in enumerate(texts[start_idx+1:], start=start_idx+1) if t == TOTAL_TEXT), -1)
-        if total_idx_after_mja != -1:
-            end_idx = min(end_idx, total_idx_after_mja)
-        idx = start_idx + 1
-        while idx < end_idx:
-            if idx + 1 < end_idx:
+        
+        # Define boundary for this MJA's payments:
+        # It ends at the next MJA ref, or TOTAL_TEXT (if TOTAL appears before next MJA), or end of text list.
+        # The TOTAL_TEXT referred to here is the one that sums up this MJA's payments, not the grand total at the end.
+        # This assumption might be fragile if "TOTAL" appears ambiguously.
+        
+        next_mja_idx = mja_indices[i+1] if i + 1 < len(mja_indices) else len(texts)
+        # Look for a "TOTAL" that is specific to this MJA block, before the next MJA or end of all texts.
+        # This is tricky if TOTAL is only at the very end for the whole MJR.
+        # For now, assume payment items for an MJA are grouped before the next MJA.
+        block_end_idx = next_mja_idx
+        
+        logger.debug(f"  Extracting payments for MJA {mja_ref} (text index {current_mja_start_idx}) up to text index {block_end_idx}")
+        
+        idx = current_mja_start_idx + 1 # Start looking for payments after the MJA reference itself
+        while idx < block_end_idx:
+            if idx + 1 < block_end_idx: # Need a label and a value
                 label_text = texts[idx]
                 value_text = texts[idx+1]
                 label_lower = label_text.lower()
-                if value_text.startswith('£'):
+                
+                if value_text.startswith('£'): # Check if value is a monetary amount
                     pay_key = PAYMENT_LABELS_MAP.get(label_lower)
                     if pay_key:
                         payment_details[pay_key] = value_text
@@ -257,27 +282,48 @@ def extract_mja_payment_blocks(texts: List[str]) -> List[Dict[str, Any]]:
                         payment_details['pay_urg'] = value_text
                     elif OOH_SUBSTRING in label_lower and 'pay_ooh' not in payment_details:
                         payment_details['pay_ooh'] = value_text
-                idx += 2
-            else:
+                    idx += 2 # Move past label and value
+                else: # Value is not '£...', might be end of useful pairs for this specific MJA block
+                      # or just a non-payment related text item.
+                    idx += 1
+            else: # No pair left
                 idx += 1
-        if len(payment_details) > 1:
+        if len(payment_details) > 1: # Add if any actual payment items were found besides just the 'mja' key
             mja_payment_blocks.append(payment_details)
-    logger.debug(f"Extracted {len(mja_payment_blocks)} MJA payment blocks.")
+            
+    logger.debug(f"Extracted {len(mja_payment_blocks)} MJA payment blocks in total.")
     return mja_payment_blocks
 
+
 def extract_notes_and_total(texts: List[str]) -> Dict[str, Any]:
+    # ... (previous implementation of extract_notes_and_total - assuming this part is largely correct for overall total and notes) ...
     notes_total_data = {'notes_raw': None, 'pay_total_raw': None}
     disclaimer_idx = next((i for i, t in enumerate(texts) if t.startswith(DISCLAIMER_START_TEXT)), len(texts))
-    total_label_idx = next((i for i, t in enumerate(texts) if t == TOTAL_TEXT), -1)
+    # Find the *last* TOTAL before the disclaimer, as this is likely the grand total
+    total_label_idx = -1
+    for i in range(disclaimer_idx -1, -1, -1): # Search backwards from disclaimer
+        if texts[i] == TOTAL_TEXT:
+            if i + 1 < disclaimer_idx and texts[i+1].startswith('£'): # Ensure it's followed by a monetary value
+                total_label_idx = i
+                break 
+            
     if total_label_idx != -1:
-        notes_start_idx = total_label_idx + 1
-        if total_label_idx + 1 < len(texts) and texts[total_label_idx + 1].startswith('£'):
+        notes_start_idx = total_label_idx + 1 # Text after TOTAL label
+        if texts[total_label_idx + 1].startswith('£'): # If value is present
             notes_total_data['pay_total_raw'] = texts[total_label_idx + 1]
-            notes_start_idx = total_label_idx + 2
-        if notes_start_idx < disclaimer_idx:
-            notes_texts_filtered = [t for t in texts[notes_start_idx:disclaimer_idx] if t not in INFO_BLOCK_TERMINATORS and not MJA_REF_PATTERN.match(t)]
-            notes_total_data['notes_raw'] = "\n".join(notes_texts_filtered).strip() if notes_texts_filtered else None
+            notes_start_idx = total_label_idx + 2 # Notes start after the value
+        
+        # Notes run from after the total/value up to the disclaimer
+        # Filter out any MJA refs or common terminators that might be in the notes section
+        notes_texts_filtered = [
+            t for t in texts[notes_start_idx:disclaimer_idx] 
+            if t not in INFO_BLOCK_TERMINATORS and not MJA_REF_PATTERN.match(t)
+        ]
+        notes_total_data['notes_raw'] = "\n".join(notes_texts_filtered).strip() if notes_texts_filtered else None
+    else:
+        logger.warning("Grand TOTAL anchor for payment not found before disclaimer.")
     return notes_total_data
+
 
 def parse_detail_data(
     header_info: Dict[str, Any], is_multiday: bool, info_block: Dict[str, Any],
@@ -288,12 +334,19 @@ def parse_detail_data(
     parsed['is_multiday'] = 1 if is_multiday else 0
     parsed['mjr_id'] = header_info.get('mjr_id_raw')
     parsed['header_total'] = parse_money(header_info.get('total_value_header_raw'))
-    parsed['booking_date'], parsed['start_time'], parsed['end_time'], parsed['duration'] = None, None, None, None
+    
+    # Initialize common fields that might be specific per day or general for single day
+    parsed['booking_date'] = None
+    parsed['start_time'] = None
+    parsed['end_time'] = None
+    parsed['duration'] = None # This will be from list page if not found on detail for single day
 
     if is_multiday:
         parsed['multiday_date_range'] = header_info.get('multiday_date_range_raw')
         parsed['multiday_appointment_info'] = header_info.get('multiday_appointment_count_raw')
-    else:
+        # MJA ID is not for the top-level MJR, but for each day block
+        parsed['mja_id'] = None
+    else: # Single Day specific date/time from header
         parsed['multiday_date_range'], parsed['multiday_appointment_info'] = None, None
         date_time_tuple = header_info.get('date_time_raw_tuple')
         if date_time_tuple and isinstance(date_time_tuple, tuple) and len(date_time_tuple) == 2:
@@ -303,15 +356,21 @@ def parse_detail_data(
                 parsed['booking_date'] = parse_uk_date(date_match.group(1))
             time_match = TIME_PART_REGEX.match(time_part_str)
             if time_match:
-                parsed['start_time'] = parse_time(time_match.group(1)) # This returns HH:MM:SS string
-                parsed['end_time'] = parse_time(time_match.group(2))   # This returns HH:MM:SS string
-                # MODIFIED: Use imported functions
-                st_obj = parse_datetime_from_time_string(time_match.group(1)) # This expects HH:MM string and returns time object
-                et_obj = parse_datetime_from_time_string(time_match.group(2)) # This expects HH:MM string and returns time object
+                # Use the raw time strings for start_time_raw, end_time_raw if needed by other logic
+                # For direct storage, parse_time converts to HH:MM:SS string
+                parsed['start_time'] = parse_time(time_match.group(1))
+                parsed['end_time'] = parse_time(time_match.group(2))
+                st_obj = parse_datetime_from_time_string(time_match.group(1))
+                et_obj = parse_datetime_from_time_string(time_match.group(2))
                 parsed['duration'] = calculate_duration_string(st_obj, et_obj)
         else:
             logger.warning(f"Could not parse date/time for single day from header: {date_time_tuple}")
+        # For single day, MJA ID might come from the (only) payment block or be passed from state
+        single_day_payment_data_block = payment_blocks[0] if payment_blocks and isinstance(payment_blocks[0], dict) else {}
+        parsed['mja_id'] = single_day_payment_data_block.get('mja')
 
+
+    # Common info block data
     for key, raw_key in {
         'language_pair': 'language_pair_raw', 'client_name': 'client_name_raw',
         'booking_type': 'booking_type_raw', 'contact_name': 'contact_name_raw',
@@ -333,88 +392,100 @@ def parse_detail_data(
             except (ValueError, TypeError):
                 logger.warning(f"Could not parse distance value: {dist_raw}")
 
+    # Overall total and notes from the end of the page
     parsed['overall_total'] = parse_money(notes_total_info.get('pay_total_raw'))
-    parsed['multiday_payments'] = []
-    calculated_day_total: Optional[float] = None
+    parsed['notes'] = notes_total_info.get('notes_raw')
+
+    # Process payments
+    parsed['multiday_payments'] = [] # Holds list of dicts, each dict is one MJA's data for multiday
+    
+    # Fields for individual day payments (these will be at top level for single day, or per item in multiday_payments)
+    payment_field_suffixes = ['sl', 'td', 'tt', 'aep', 'ooh', 'urg']
 
     if is_multiday:
-        parsed['mja_id'] = None
-        start_date_obj: Optional[datetime.date] = None # Use datetime.date for date objects
+        start_date_obj: Optional[datetime.date] = None
         if parsed.get('multiday_date_range_raw'):
             try:
-                start_date_str_from_range = parsed['multiday_date_range_raw'].split(' - ')[0]
-                temp_date_uk = parse_uk_date(start_date_str_from_range) # Ensures DD-MM-YYYY
+                start_date_str_from_range = parsed['multiday_date_range_raw'].split(' - ')[0].strip()
+                temp_date_uk = parse_uk_date(start_date_str_from_range)
                 if temp_date_uk:
                     start_date_obj = datetime.strptime(temp_date_uk, "%d-%m-%Y").date()
             except Exception as e:
-                logger.error(f"Could not parse start date from range '{parsed.get('multiday_date_range_raw')}': {e}")
+                logger.error(f"Could not parse start date from multiday range '{parsed.get('multiday_date_range_raw')}': {e}")
 
-        for i, day_payment_raw in enumerate(payment_blocks):
-            if not isinstance(day_payment_raw, dict):
+        for i, mja_day_block_raw in enumerate(payment_blocks): # payment_blocks contains dict for each MJA
+            if not isinstance(mja_day_block_raw, dict) or not mja_day_block_raw.get('mja'):
+                logger.warning(f"Skipping invalid or MJA-less payment block at index {i}: {mja_day_block_raw}")
                 continue
-            parsed_day: Dict[str, Any] = {'mja': day_payment_raw.get('mja')}
+
+            day_specific_data: Dict[str, Any] = {'mja': mja_day_block_raw.get('mja')}
+            
             day_booking_date: Optional[str] = None
             if start_date_obj:
                 try:
                     day_booking_date = (start_date_obj + timedelta(days=i)).strftime("%d-%m-%Y")
-                except Exception as e_calc:
-                    logger.error(f"Error calculating date for MJA seq {i+1}: {e_calc}")
-            parsed_day['booking_date'] = day_booking_date
-            parsed_day['start_time'] = None # Multiday items typically don't have individual start/end on header
-            parsed_day['end_time'] = None
-            parsed_day['duration'] = None # Duration would be per-day if available elsewhere
+                except Exception as e_calc_date:
+                    logger.error(f"Error calculating date for MJA {day_specific_data['mja']} (seq {i+1}): {e_calc_date}")
+            day_specific_data['booking_date'] = day_booking_date
+            
+            # For multiday, start/end times are usually not per MJA on detail page. Set to None.
+            day_specific_data['start_time'] = None
+            day_specific_data['end_time'] = None
+            day_specific_data['duration'] = None # Individual duration might not be available
 
-            for key_suffix in ['sl', 'td', 'tt', 'aep', 'ooh', 'urg']:
-                parsed_day[f'pay_{key_suffix}'] = parse_money(day_payment_raw.get(f'pay_{key_suffix}'))
-            parsed['multiday_payments'].append(parsed_day)
-
-        num_days = 0
-        if parsed['multiday_appointment_info']:
-            match = APPOINTMENT_COUNT_PATTERN.search(parsed['multiday_appointment_info'])
-            if match:
-                try:
-                    num_days_str = match.group(2) or match.group(1) # Prefer days count if available
-                    num_days = int(num_days_str) if num_days_str else 0
-                except:
-                    num_days = 0
-        if num_days == 0 and parsed['multiday_payments']: # Fallback to number of payment blocks if count unreliable
-            num_days = len(parsed['multiday_payments'])
-
-        if num_days > 0 and parsed['overall_total'] is not None:
-            try:
-                calculated_day_total = round(parsed['overall_total'] / num_days, 2)
-            except ZeroDivisionError:
-                calculated_day_total = None
-        else:
-            calculated_day_total = None
-
-        for key_suffix in ['sl', 'td', 'tt', 'aep', 'ooh', 'urg']: # Nullify these at the top level for multiday
+            current_day_total_calc = 0.0
+            found_any_payment_for_day = False
+            for key_suffix in payment_field_suffixes:
+                raw_payment_val = mja_day_block_raw.get(f"pay_{key_suffix}")
+                parsed_payment_val = parse_money(raw_payment_val)
+                day_specific_data[f'pay_{key_suffix}'] = parsed_payment_val
+                if parsed_payment_val is not None:
+                    current_day_total_calc += parsed_payment_val
+                    found_any_payment_for_day = True
+            
+            day_specific_data['day_total'] = current_day_total_calc if found_any_payment_for_day else None # Sum of actual payments for this MJA
+            parsed['multiday_payments'].append(day_specific_data)
+        
+        # Nullify top-level day_pay_ and day_total for multiday MJR record, they are per MJA
+        for key_suffix in payment_field_suffixes:
             parsed[f'day_pay_{key_suffix}'] = None
-        parsed['day_total'] = calculated_day_total # This is the average day total for the MJR
+        parsed['day_total'] = None # Overall total is MJR level, day_total is per MJA in multiday_payments
 
     else: # Single Day
-        single_day_payment_data = payment_blocks[0] if payment_blocks and isinstance(payment_blocks[0], dict) else {}
-        parsed['mja_id'] = single_day_payment_data.get('mja')
-        parsed['multiday_payments'] = None
-        for key_suffix in ['sl', 'td', 'tt', 'aep', 'ooh', 'urg']:
-            parsed[f"day_pay_{key_suffix}"] = parse_money(single_day_payment_data.get(f"pay_{key_suffix}"))
-        parsed['day_total'] = parsed['overall_total']
-        # booking_date, start_time, end_time, duration are already set from header for single day
+        # MJA ID should be set from header or single payment block
+        if not parsed.get('mja_id') and payment_blocks and payment_blocks[0].get('mja'):
+             parsed['mja_id'] = payment_blocks[0].get('mja')
 
-    parsed['notes'] = notes_total_info.get('notes_raw')
-    if (not parsed['meeting_link'] or parsed['meeting_link'] == MEETING_LINK_TEXT) and parsed['notes']:
+        single_day_payment_data_block = payment_blocks[0] if payment_blocks else {}
+        current_day_total_calc = 0.0
+        found_any_payment_for_day = False
+        for key_suffix in payment_field_suffixes:
+            raw_payment_val = single_day_payment_data_block.get(f"pay_{key_suffix}")
+            parsed_payment_val = parse_money(raw_payment_val)
+            parsed[f"day_pay_{key_suffix}"] = parsed_payment_val
+            if parsed_payment_val is not None:
+                current_day_total_calc += parsed_payment_val
+                found_any_payment_for_day = True
+        
+        # For single day, day_total is the sum of its payments, should match overall_total if parsing is complete
+        parsed['day_total'] = current_day_total_calc if found_any_payment_for_day else parsed['overall_total']
+        parsed['multiday_payments'] = None # Explicitly None for single day
+
+    # Final check for meeting link in notes
+    if (not parsed.get('meeting_link') or parsed.get('meeting_link') == MEETING_LINK_TEXT) and parsed.get('notes'):
         link_match = MEETING_LINK_PATTERN.search(parsed['notes'])
         if link_match:
             parsed['meeting_link'] = link_match.group(0)
             logger.info(f"Extracted meeting link from notes: {parsed['meeting_link']}")
-    if parsed['meeting_link'] == MEETING_LINK_TEXT: # If it's still the placeholder text
+    if parsed.get('meeting_link') == MEETING_LINK_TEXT: # Clean up placeholder if it's still there
         parsed['meeting_link'] = None
 
-    logger.debug(f"Final Parsed Data Keys: {list(parsed.keys())}")
+    logger.debug(f"Final Parsed Detail Data (keys: {list(parsed.keys())}) for MJR {parsed.get('mjr_id')}")
     return parsed
 
 def check_if_multiday_from_xml(xml_content: str) -> bool:
-    text_attribute_regex = re.compile(r'\btext="([^"]*)"') # Ensure \b for word boundary
+    # ... (previous implementation of check_if_multiday_from_xml) ...
+    text_attribute_regex = re.compile(r'\btext="([^"]*)"') 
     try:
         for match in text_attribute_regex.finditer(xml_content):
             if MULTIDAY_TEXT in html.unescape(match.group(1)):
